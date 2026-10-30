@@ -11,7 +11,7 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 - [Pipeline Overview](#-pipeline-overview)
 - [Project Structure](#-project-structure)
 - [What Each File Does](#-what-each-file-does)
-- [Prerequisites](#-prerequisites)
+- [Prerequisites](#-prerequisites) 
 - [Installation](#-installation)
 - [Model Setup](#-model-setup)
 - [Configuration](#-configuration)
@@ -796,4 +796,4 @@ Increase `lost_track_timeout` in `config.yaml` and lower `vehicle_confidence` to
 
 ##  Author
 
-Ansh Upadhyay
+Devanshi Singal

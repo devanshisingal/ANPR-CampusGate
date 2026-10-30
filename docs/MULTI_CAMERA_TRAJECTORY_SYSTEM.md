@@ -798,7 +798,7 @@ loads from a CDN in the browser.
 ### Demo — four virtual cameras from one recording
 
 ```bash
-cd /home/ansh/alpr/alpr-university-gate
+cd /home/devanshi/alpr/alpr-university-gate
 
 # 1. Start the dashboard
 streamlit run src/dashboard/trajectory_app.py

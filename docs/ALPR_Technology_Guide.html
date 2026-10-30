@@ -78,7 +78,7 @@ network of cameras.</p>
 <tr><td>JetPack / L4T</td><td>R39 (release), revision 2.0</td><td>NVIDIA's board support package: Linux kernel, GPU driver, CUDA, TensorRT.</td></tr>
 <tr><td>Operating system</td><td>Ubuntu 24.04.4 LTS</td><td>Base OS supplied by JetPack.</td></tr>
 <tr><td>CUDA</td><td>13.2 (V13.2.78)</td><td>NVIDIA's GPU computing platform used by TensorRT, PyTorch and PyCUDA.</td></tr>
-<tr><td>Python</td><td>3.12.3, in virtual environment <code>/home/ansh/alpr/alpr_env</code></td><td>All application code is Python.</td></tr>
+<tr><td>Python</td><td>3.12.3, in virtual environment <code>/home/devanshi/alpr/alpr_env</code></td><td>All application code is Python.</td></tr>
 </table>
 <div class="note"><b>Jetson detail:</b> TensorRT is installed by JetPack into <code>/usr/lib/python3.12/dist-packages</code>, which a virtual environment cannot see by default. <code>src/utils/jetson_paths.py</code> adds that path at startup; without it Ultralytics tries to download TensorRT from the internet and hangs.</div>
 
@@ -605,7 +605,7 @@ alpr-university-gate/
 <tr><td>Single-gate pipeline (optional)</td><td>—</td><td><code>python main.py</code> or <code>python scripts/run_pipeline.py --source ALPR.mp4</code></td></tr>
 <tr><td>Original dashboard (optional)</td><td>8501</td><td><code>streamlit run src/dashboard/app.py</code></td></tr>
 </table>
-<p>Activate the environment first: <code>source /home/ansh/alpr/alpr_env/bin/activate</code>, then run commands from the project folder.</p>
+<p>Activate the environment first: <code>source /home/devanshi/alpr/alpr_env/bin/activate</code>, then run commands from the project folder.</p>
 <h2>17.2 Typical workflow</h2>
 <ol>
   <li>Open <code>http://&lt;jetson-ip&gt;:8501</code>.</li>

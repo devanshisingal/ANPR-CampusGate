@@ -196,7 +196,7 @@ class TestRTSPValidation:
 
     def test_rejects_something_that_is_not_a_stream_url(self, camera):
         live = dataclasses.replace(
-            camera, source_type=SourceType.RTSP, rtsp_url="/home/ansh/clip.mp4"
+            camera, source_type=SourceType.RTSP, rtsp_url="/home/devanshi/clip.mp4"
         )
         with pytest.raises(VideoSourceError, match="not a recognised stream URL"):
             create_video_source(live, {}).validate()
