@@ -53,14 +53,25 @@ detection:
   # Point *_model_path at a .engine file (run scripts/export_detectors_trt.sh
   # once on-device) for the biggest latency win — raw .pt inference through
   # PyTorch/ultralytics is 3-5x slower than TensorRT on this hardware.
-  device: 0
-  half: true
-  vehicle_model_path: "models/vehicle_detector/yolov8n.engine"
+  device: "cpu"
+  half: false
+  vehicle_model_path: "models/vehicle_detector/yolov8n.onnx"
   vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
   vehicle_imgsz: 480                       # full-frame detection; 480 balances speed/recall
-  plate_model_path: "models/plate_detector/best.engine"
+  plate_model_path: "models/plate_detector/best.pt"
   plate_confidence: 0.4                    # Back to conservative
   plate_imgsz: 320                         # plate search is within an already-localized vehicle crop
+
+  # -- Ensemble Fusion --------------------------------------------------------
+  # Run baseline and fine-tuned models simultaneously and fuse plate boxes.
+  # If best_finetuned.pt is not yet downloaded, it automatically uses best.pt.
+  plate_ensemble:
+    enabled: true
+    models:
+      - "models/plate_detector/best.pt"
+      - "models/plate_detector/best_finetuned.pt"
+    iou_threshold: 0.45
+    fusion_strategy: "weighted_box"   # options: weighted_box (WBF), highest_confidence
 
 tracking:
   # In PROCESSED frames, not video frames. frame_skip went from 2 to 1
@@ -116,7 +127,7 @@ ocr:
   # Choose OCR backend. For GPU TensorRT experiments set to `parseq_tensorrt`.
   # RapidOCR is the more reliable CPU backend for this video pipeline.
   # PARSeq TensorRT is available for GPU inference/experiments.
-  backend: "parseq_tensorrt"
+  backend: "rapidocr"
 
   # ── RapidOCR (Phase 1 — active) ───────────────────────────────────────────
   # Runs PP-OCRv3/v4 ONNX models via onnxruntime (CPU on JetPack 7.2).
