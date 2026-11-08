@@ -218,8 +218,32 @@ color_classifier:
     Army_Green: [[35, 75], [30, 120], [30, 120]]
 
 direction:
-  virtual_line: {x1: 0, y1: 360, x2: 1280, y2: 360}
+  # Active camera profile: "ch01" (Main Gate 2), "ch02" (Gate 2), or "default"
+  active_camera: "ch01"
+  min_displacement_px: 25.0
+  min_confirm_frames: 3
+  history_frames: 15
+  cone_angle_deg: 55.0
   dual_camera: false
+  virtual_line: {x1: 0, y1: 360, x2: 1280, y2: 360}
+
+  cameras:
+    ch01:
+      name: "Main Gate 2"
+      camera_id: "ch01"
+      # IN: moves towards lower-right (+x, +y)
+      # OUT: moves towards upper-left (-x, -y)
+      in_vector: [0.7071, 0.7071]
+      out_vector: [-0.7071, -0.7071]
+      virtual_line: {x1: 200, y1: 700, x2: 900, y2: 300}
+    ch02:
+      name: "Gate 2"
+      camera_id: "ch02"
+      # IN: moves towards lower-left (-x, +y)
+      # OUT: moves towards upper-right (+x, -y)
+      in_vector: [-0.7071, 0.7071]
+      out_vector: [0.7071, -0.7071]
+      virtual_line: {x1: 100, y1: 300, x2: 800, y2: 700}
 
 motion_filter:
   # On Jetson with OpenCV upscale (no Real-ESRGAN), the pipeline is faster

@@ -131,7 +131,9 @@ def _store_event(
 
     color = color_classifier.classify(plate_crop)
     vehicle_type = vehicle_classifier.classify(color)
-    direction = direction_detector.update(track_id, centroid) or "IN"
+    direction = direction_detector.get_direction(track_id)
+    if not direction or direction == "UNKNOWN":
+        direction = direction_detector.update(track_id, centroid) or "UNKNOWN"
     image_path = database.save_plate_image(plate_crop, plate_number, image_save_path)
 
     # Only written when a crop was actually passed in, so the single-gate
@@ -421,7 +423,6 @@ def run_pipeline(
     color_classifier   = ColorClassifier.from_config(config)
     vehicle_classifier = VehicleClassifier()
     dup_filter         = DuplicateFilter.from_config(config)
-    direction_detector = DirectionDetector.from_config(config)
     motion_filter      = MotionFilter.from_config(config)
     # Body colour for vehicle profiles. Pure NumPy/OpenCV with no model to
     # load; it runs once per stored vehicle, not per frame.
@@ -438,6 +439,7 @@ def run_pipeline(
     # multi-camera run the manager supplies the current camera's block.
     if camera_meta is None:
         camera_meta = get_camera_metadata(config)
+    direction_detector = DirectionDetector.from_config(config, camera_id=camera_meta.get("camera_id"))
     log.info(
         "Camera: %s (%s) at lat=%s lon=%s",
         camera_meta["camera_id"], camera_meta["camera_name"],
@@ -680,8 +682,9 @@ def run_pipeline(
                 tid = track.track_id
                 x1, y1, x2, y2 = track.bbox
 
-                # Motion filter — skip for first 5 frames to build history
+                # Update motion and direction tracking every frame
                 motion_filter.update(tid, track.centroid)
+                direction_detector.update(tid, track.centroid)
                 track_centroids[tid] = track.centroid
                 track_classes[tid] = track.class_label
 
@@ -868,7 +871,9 @@ def run_pipeline(
                                 # Enforce strict once-per-track emission.
                                 # After this point, no further flush/store attempts for this tid.
                                 stored_tracks.add(tid)
-                                track_display_labels[tid] = (plate_val, True)
+                                dir_label = direction_detector.get_direction(tid)
+                                display_str = f"{plate_val} [{dir_label}]" if dir_label != "UNKNOWN" else plate_val
+                                track_display_labels[tid] = (display_str, True)
                                 continue
 
             # Only draw the overlay when the publisher will actually write
