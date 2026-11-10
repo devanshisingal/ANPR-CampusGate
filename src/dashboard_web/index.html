@@ -22,15 +22,11 @@
   <main class="layout">
     <section class="panel panel-feed">
       <div class="panel-header">
-        <h2>Live camera feed</h2>
-        <span id="feed-updated" class="muted">—</span>
+        <h2>Live camera feeds</h2>
+        <span id="feeds-summary" class="muted">Checking feeds…</span>
       </div>
-      <div class="feed-frame">
-        <img id="feed-img" alt="Live camera feed" src="/snapshot">
-        <div id="feed-offline" class="feed-offline hidden">
-          <p>No live feed available.</p>
-          <p class="muted">The recognition pipeline is not currently running or has not produced a frame yet.</p>
-        </div>
+      <div id="camera-feeds" class="camera-feed-grid">
+        <p class="muted">Loading configured camera feeds…</p>
       </div>
       <div class="feed-legend">
         <span><i class="swatch swatch-amber"></i>Reading</span>
@@ -71,6 +67,18 @@
         <button type="submit">Search</button>
         <button type="button" id="search-clear" class="secondary">Clear</button>
       </form>
+      <div class="event-filters">
+        <label>From <input id="filter-start-date" type="date"></label>
+        <label>To <input id="filter-end-date" type="date"></label>
+        <label>Direction
+          <select id="filter-direction">
+            <option value="ALL">All</option>
+            <option value="IN">IN</option>
+            <option value="OUT">OUT</option>
+            <option value="UNKNOWN">Unknown</option>
+          </select>
+        </label>
+      </div>
       <p id="search-summary" class="muted"></p>
     </section>
 
@@ -91,6 +99,7 @@
             <tr>
               <th></th>
               <th>Plate</th>
+              <th>Access</th>
               <th>Direction</th>
               <th>Vehicle type</th>
               <th>Color</th>
@@ -100,7 +109,7 @@
             </tr>
           </thead>
           <tbody id="events-body">
-            <tr><td colspan="8" class="muted center">Loading records…</td></tr>
+            <tr><td colspan="9" class="muted center">Loading records…</td></tr>
           </tbody>
         </table>
       </div>

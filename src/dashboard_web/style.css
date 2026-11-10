@@ -171,10 +171,51 @@ body {
 
 /* ---- Live feed ---- */
 
+.camera-feed-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.camera-feed-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.camera-feed-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.camera-feed-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.camera-feed-status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+}
+
+.camera-feed-status.online::before {
+  background: var(--green);
+}
+
 .feed-frame {
   position: relative;
   background: #10131a;
-  border-radius: 6px;
   overflow: hidden;
   aspect-ratio: 16 / 9;
 }
@@ -184,6 +225,17 @@ body {
   height: 100%;
   object-fit: contain;
   display: block;
+}
+
+.feed-frame .camera-feed-placeholder {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: #cdd2db;
+  padding: 16px;
 }
 
 .feed-offline {
@@ -276,6 +328,32 @@ body {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-weak);
+}
+
+.event-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.event-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.event-filters input,
+.event-filters select {
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
 }
 
 button {
@@ -397,6 +475,30 @@ tbody tr:hover {
   font-family: var(--mono);
   font-weight: 600;
   letter-spacing: 0.02em;
+}
+
+.access-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.access-authorized {
+  color: #155724;
+  background: #d4edda;
+}
+
+.access-blacklisted {
+  color: #721c24;
+  background: #f8d7da;
+}
+
+.access-unknown {
+  color: #725000;
+  background: #fff3cd;
 }
 
 /* Camera name on top, its id beneath in smaller muted type -- both fit in

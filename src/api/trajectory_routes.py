@@ -2,9 +2,8 @@
 FastAPI routes for the multi-camera trajectory system.
 
 All mounted under /trajectory-api so they cannot collide with the existing
-single-gate routes (/entry, /logs, /search, ...) or with the static
-dashboard mounted at "/". Every existing endpoint keeps its path and its
-behaviour; this module only adds.
+single-gate routes (/entry, /logs, /search, ...). Every existing endpoint
+keeps its path and its behaviour; this module only adds.
 
   GET  /trajectory-api/cameras                camera registry
   POST /trajectory-api/cameras                add a camera site
@@ -29,11 +28,15 @@ behaviour; this module only adds.
 
 from __future__ import annotations
 
+import asyncio
+import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from src.api.schemas import (
     AddCameraRequest,
@@ -61,6 +64,7 @@ router = APIRouter(prefix="/trajectory-api", tags=["multi-camera"])
 # the Jetson's disk. Read fully into memory before writing, so this is also
 # the memory ceiling per upload.
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+_CAMERA_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ── lazily-built shared state ─────────────────────────────────────────────
@@ -112,6 +116,134 @@ def _get_engine() -> TrajectoryEngine:
     without restarting the API.
     """
     return TrajectoryEngine.from_registry(_get_registry())
+
+
+def _feed_settings() -> tuple[dict, Path, Path, Optional[str]]:
+    """Resolve shared frame/status paths relative to the repository root."""
+    from src.utils.config import load_config
+
+    config = load_config(str(_REPO_ROOT / "config" / "config.yaml"))
+    api_config = config.get("api") or {}
+
+    def resolve(value: str) -> Path:
+        path = Path(value)
+        return path if path.is_absolute() else _REPO_ROOT / path
+
+    frames_dir = resolve(api_config.get("live_frames_dir", "data/live_frames"))
+    status_path = resolve(_get_registry().processing.get(
+        "status_file", "data/processing_status.json"
+    ))
+    camera = config.get("camera") or {}
+    configured_camera_id = camera.get("camera_id")
+    return (
+        api_config, frames_dir, status_path,
+        str(configured_camera_id) if configured_camera_id else None,
+    )
+
+
+def _camera_frame_path(
+    camera_id: str,
+    settings: Optional[tuple[dict, Path, Path, Optional[str]]] = None,
+) -> Path:
+    if not _CAMERA_ID_PATTERN.fullmatch(camera_id):
+        raise HTTPException(status_code=400, detail="Invalid camera id")
+    camera = _get_registry().get(camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail=f"No camera {camera_id!r}")
+
+    api_config, frames_dir, _, configured_camera_id = settings or _feed_settings()
+    frame_path = frames_dir / f"{camera_id}.jpg"
+    # The single-camera runner keeps its longstanding shared-frame path.
+    if not frame_path.is_file():
+        if configured_camera_id == camera_id:
+            path = Path(api_config.get("live_frame_path", "data/live_frame.jpg"))
+            frame_path = path if path.is_absolute() else _REPO_ROOT / path
+    return frame_path
+
+
+@router.get("/cameras/feeds")
+def camera_feed_status():
+    """Return each configured camera's real, freshness-based feed health."""
+    settings = _feed_settings()
+    api_config, _, status_path, _ = settings
+    status = StatusStore(str(status_path)).read() or {}
+    progress_by_id = {
+        item.get("camera_id"): item for item in status.get("cameras", [])
+        if item.get("camera_id")
+    }
+    now = time.time()
+    stale_after = max(1.0, float(api_config.get("live_frame_stale_seconds", 15.0)))
+    feeds = []
+    for camera in _get_registry():
+        frame_path = _camera_frame_path(camera.camera_id, settings)
+        try:
+            modified_at = frame_path.stat().st_mtime
+            frame_data = frame_path.read_bytes()
+            if not (frame_data.startswith(b"\xff\xd8") and frame_data.endswith(b"\xff\xd9")):
+                raise OSError("camera frame is not a complete JPEG")
+            age = max(0.0, now - modified_at)
+            online = camera.enabled and age <= stale_after
+            last_frame_at = datetime.fromtimestamp(modified_at).astimezone().isoformat()
+        except OSError:
+            age = None
+            online = False
+            last_frame_at = None
+        progress = progress_by_id.get(camera.camera_id) or {}
+        feeds.append({
+            "camera_id": camera.camera_id,
+            "camera_name": camera.camera_name,
+            "enabled": camera.enabled,
+            "online": online,
+            "last_frame_at": last_frame_at,
+            "frame_age_seconds": round(age, 2) if age is not None else None,
+            "processing_state": progress.get("state", "idle"),
+            "snapshot_url": f"/trajectory-api/cameras/{camera.camera_id}/snapshot",
+            "stream_url": f"/trajectory-api/cameras/{camera.camera_id}/stream",
+        })
+    return feeds
+
+
+@router.get("/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: str):
+    """Serve the latest annotated frame produced by this camera."""
+    path = _camera_frame_path(camera_id)
+    if not path.is_file():
+        raise HTTPException(status_code=503, detail="No frame available for this camera")
+    return FileResponse(str(path), media_type="image/jpeg")
+
+
+@router.get("/cameras/{camera_id}/stream")
+async def camera_stream(camera_id: str):
+    """Serve the camera's annotated frames as an independent MJPEG stream."""
+    settings = _feed_settings()
+    path = _camera_frame_path(camera_id, settings)
+    api_config = settings[0]
+    boundary = "alprframe"
+    poll_interval = 1.0 / max(
+        float(api_config.get("live_frames_fps", 15.0)), 0.1
+    )
+
+    async def frame_generator():
+        last_mtime = None
+        while True:
+            try:
+                modified_at = path.stat().st_mtime
+                if modified_at != last_mtime:
+                    last_mtime = modified_at
+                    data = path.read_bytes()
+                    yield (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(data)}\r\n\r\n"
+                    ).encode("ascii") + data + b"\r\n"
+            except FileNotFoundError:
+                pass
+            await asyncio.sleep(poll_interval)
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
 
 
 def _reconstruct(plate: str, processing_session: Optional[str]):

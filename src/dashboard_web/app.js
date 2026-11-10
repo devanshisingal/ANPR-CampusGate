@@ -2,7 +2,6 @@
   "use strict";
 
   const REFRESH_MS = 4000;
-  const FEED_CHECK_MS = 3000;
   const HEALTH_CHECK_MS = 5000;
 
   const el = (id) => document.getElementById(id);
@@ -16,9 +15,11 @@
   const autoRefreshToggle = el("auto-refresh-toggle");
   const statusDot = el("status-dot");
   const statusText = el("status-text");
-  const feedImg = el("feed-img");
-  const feedOffline = el("feed-offline");
-  const feedUpdated = el("feed-updated");
+  const feedsSummary = el("feeds-summary");
+  const cameraFeeds = el("camera-feeds");
+  const filterStartDate = el("filter-start-date");
+  const filterEndDate = el("filter-end-date");
+  const filterDirection = el("filter-direction");
   const detailOverlay = el("detail-overlay");
   const detailImg = el("detail-img");
   const detailFields = el("detail-fields");
@@ -28,6 +29,26 @@
 
   let currentSearch = null; // null = showing recent events, else the query string
   let lastEvents = [];
+
+  function localDateValue(date) {
+    const offset = date.getTimezoneOffset() * 60000;
+    return new Date(date.getTime() - offset).toISOString().slice(0, 10);
+  }
+
+  const today = localDateValue(new Date());
+  filterStartDate.value = today;
+  filterEndDate.value = today;
+
+  function filterParams() {
+    const params = new URLSearchParams();
+    if (filterStartDate.value) params.set("start_date", filterStartDate.value);
+    if (filterEndDate.value) params.set("end_date", filterEndDate.value);
+    if (!filterStartDate.value && !filterEndDate.value) params.set("all_time", "true");
+    if (filterDirection.value !== "ALL") {
+      params.set("direction", filterDirection.value);
+    }
+    return params;
+  }
 
   function fmtTime(iso) {
     if (!iso) return "—";
@@ -63,7 +84,7 @@
 
   function thumbUrl(imagePath) {
     if (!imagePath) return null;
-    const name = imagePath.split("/").pop();
+    const name = String(imagePath).replace(/\\/g, "/").split("/").pop();
     return `/media/${encodeURIComponent(name)}`;
   }
 
@@ -71,20 +92,22 @@
   // and are served from /thumbnails/{vehicles,plates}/<file>.
   function profileThumbUrl(path) {
     if (!path) return null;
-    const match = String(path).match(/thumbnails\/(vehicles|plates)\/([^/]+)$/);
+    const normalizedPath = String(path).replace(/\\/g, "/");
+    const match = normalizedPath.match(/thumbnails\/(vehicles|plates)\/([^/]+)$/);
     return match ? `/thumbnails/${match[1]}/${encodeURIComponent(match[2])}` : null;
   }
 
   function renderTable(events) {
     lastEvents = events;
     if (!events.length) {
-      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">No records found.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="9" class="muted center">No records found.</td></tr>`;
       return;
     }
 
     eventsBody.innerHTML = events.map((ev, idx) => {
-      const thumb = thumbUrl(ev.image_path);
-      const pillClass = ev.direction === "IN" ? "pill-in" : "pill-out";
+      const thumb = profileThumbUrl(ev.plate_thumbnail_path) || thumbUrl(ev.image_path);
+      const pillClass = ev.direction === "IN" ? "pill-in" : ev.direction === "OUT" ? "pill-out" : "";
+      const accessClass = String(ev.access_status || "Unknown").toLowerCase();
       const coords = fmtCoords(ev);
       const map = mapUrl(ev);
       return `
@@ -94,6 +117,7 @@
             : `<span class="thumb thumb-missing"></span>`
           }</td>
           <td class="plate-text">${escapeHtml(ev.plate_number)}</td>
+          <td><span class="access-badge access-${escapeHtml(accessClass)}">${escapeHtml(ev.access_status || "Unknown")}</span></td>
           <td><span class="pill ${pillClass}">${escapeHtml(ev.direction)}</span></td>
           <td>${escapeHtml(ev.vehicle_type || "—")}</td>
           <td>${escapeHtml(ev.plate_color || "—")}</td>
@@ -132,6 +156,7 @@
     detailImg.style.display = thumb ? "" : "none";
     detailFields.innerHTML = `
       <dt>Plate</dt><dd class="plate-text">${escapeHtml(ev.plate_number)}</dd>
+      <dt>Access status</dt><dd><span class="access-badge access-${escapeHtml(String(ev.access_status || "Unknown").toLowerCase())}">${escapeHtml(ev.access_status || "Unknown")}</span></dd>
       <dt>Direction</dt><dd>${escapeHtml(ev.direction)}</dd>
       ${plateThumb
         ? `<dt>Plate image</dt><dd><img class="thumb" src="${plateThumb}" alt="Plate" onerror="this.remove()"></dd>`
@@ -174,22 +199,26 @@
 
   async function loadRecent() {
     try {
-      const data = await fetchJson("/live?limit=50");
+      const params = filterParams();
+      params.set("limit", "50");
+      const data = await fetchJson(`/live?${params}`);
       renderTable(data.events || []);
     } catch (err) {
-      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">Could not load records.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="9" class="muted center">Could not load records. Check the date range and API.</td></tr>`;
     }
   }
 
   async function loadSearch(query) {
     try {
-      const data = await fetchJson(`/search?plate=${encodeURIComponent(query)}`);
+      const params = filterParams();
+      params.set("plate", query);
+      const data = await fetchJson(`/search?${params}`);
       renderTable(data);
       searchSummary.textContent = data.length
         ? `${data.length} record${data.length === 1 ? "" : "s"} for ${query.toUpperCase()}`
         : `No records found for ${query.toUpperCase()}`;
     } catch (err) {
-      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">Search failed.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="9" class="muted center">Search failed. Check the date range and API.</td></tr>`;
       searchSummary.textContent = "";
     }
   }
@@ -219,9 +248,16 @@
     loadRecent();
   });
 
+  [filterStartDate, filterEndDate, filterDirection].forEach((control) => {
+    control.addEventListener("change", () => {
+      refreshStats();
+      refreshTable();
+    });
+  });
+
   async function refreshStats() {
     try {
-      const stats = await fetchJson("/stats");
+      const stats = await fetchJson(`/stats?${filterParams()}`);
       el("stat-entries").textContent = stats.entries ?? "—";
       el("stat-exits").textContent = stats.exits ?? "—";
       el("stat-unique").textContent = stats.unique_vehicles ?? "—";
@@ -267,39 +303,85 @@
     }
   }
 
-  let feedIsLive = false;
+  function createFeedCard(feed) {
+    const card = document.createElement("article");
+    card.className = "camera-feed-card";
+    card.dataset.cameraId = feed.camera_id;
 
-  async function checkFeed() {
-    try {
-      const res = await fetch("/snapshot", { cache: "no-store" });
-      if (res.ok) {
-        if (!feedIsLive) {
-          feedIsLive = true;
-          feedOffline.classList.add("hidden");
-          feedImg.classList.remove("hidden");
-          feedImg.src = `/stream?_=${Date.now()}`;
-        }
-        feedUpdated.textContent = `Updated ${new Date().toLocaleTimeString()}`;
-      } else {
-        throw new Error("no snapshot");
-      }
-    } catch (err) {
-      if (feedIsLive) {
-        feedIsLive = false;
-        feedImg.classList.add("hidden");
-        feedOffline.classList.remove("hidden");
-        feedUpdated.textContent = "—";
-      }
-    }
+    const header = document.createElement("div");
+    header.className = "camera-feed-header";
+    const label = document.createElement("strong");
+    label.textContent = `${feed.camera_name} (${feed.camera_id})`;
+    const status = document.createElement("span");
+    status.className = "camera-feed-status";
+    status.dataset.role = "status";
+    header.append(label, status);
+
+    const frame = document.createElement("div");
+    frame.className = "feed-frame";
+    const image = document.createElement("img");
+    image.alt = `Live feed from ${feed.camera_name}`;
+    image.dataset.role = "image";
+    image.classList.add("hidden");
+    const placeholder = document.createElement("div");
+    placeholder.className = "camera-feed-placeholder";
+    placeholder.dataset.role = "placeholder";
+    frame.append(image, placeholder);
+    card.append(header, frame);
+    return card;
   }
 
-  feedImg.addEventListener("error", () => {
-    if (feedIsLive) {
-      feedIsLive = false;
-      feedImg.classList.add("hidden");
-      feedOffline.classList.remove("hidden");
+  function renderCameraFeeds(feeds) {
+    const activeIds = new Set(feeds.map((feed) => feed.camera_id));
+    for (const card of cameraFeeds.querySelectorAll(".camera-feed-card")) {
+      if (!activeIds.has(card.dataset.cameraId)) card.remove();
     }
-  });
+
+    let onlineCount = 0;
+    for (const feed of feeds) {
+      let card = [...cameraFeeds.querySelectorAll(".camera-feed-card")]
+        .find((item) => item.dataset.cameraId === feed.camera_id);
+      if (!card) {
+        card = createFeedCard(feed);
+        cameraFeeds.append(card);
+      }
+
+      const status = card.querySelector('[data-role="status"]');
+      const image = card.querySelector('[data-role="image"]');
+      const placeholder = card.querySelector('[data-role="placeholder"]');
+      status.textContent = feed.online ? "Online" : "Offline";
+      status.classList.toggle("online", Boolean(feed.online));
+
+      if (feed.online) {
+        onlineCount += 1;
+        placeholder.classList.add("hidden");
+        image.classList.remove("hidden");
+        if (image.dataset.streamUrl !== feed.stream_url) {
+          image.src = feed.stream_url;
+          image.dataset.streamUrl = feed.stream_url;
+        }
+      } else {
+        image.removeAttribute("src");
+        delete image.dataset.streamUrl;
+        image.classList.add("hidden");
+        placeholder.classList.remove("hidden");
+        placeholder.textContent = feed.enabled
+          ? "No fresh frame from this camera."
+          : "Camera is disabled.";
+      }
+    }
+    feedsSummary.textContent = feeds.length
+      ? `${onlineCount} of ${feeds.length} cameras online`
+      : "No cameras configured";
+  }
+
+  async function loadCameraFeeds() {
+    try {
+      renderCameraFeeds(await fetchJson("/trajectory-api/cameras/feeds"));
+    } catch (err) {
+      feedsSummary.textContent = "Camera status unavailable";
+    }
+  }
 
   function tick() {
     checkHealth();
@@ -337,10 +419,10 @@
   // Initial load
   loadCameraLabel();
   checkHealth();
-  checkFeed();
+  loadCameraFeeds();
   refreshStats();
   refreshTable();
 
   setInterval(tick, REFRESH_MS);
-  setInterval(checkFeed, FEED_CHECK_MS);
+  setInterval(loadCameraFeeds, HEALTH_CHECK_MS);
 })();

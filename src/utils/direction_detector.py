@@ -21,6 +21,7 @@ Features:
 from __future__ import annotations
 
 import math
+import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -143,19 +144,13 @@ class DirectionDetector:
         dir_cfg = config.get("direction", {})
         dual_camera = bool(dir_cfg.get("dual_camera", False))
 
-        profile_key = (
+        requested_profile = (
             camera_id
             or dir_cfg.get("active_camera")
             or config.get("camera", {}).get("camera_id")
             or "ch01"
-        ).lower()
-
-        if "01" in profile_key or "main" in profile_key:
-            profile_key = "ch01"
-        elif "02" in profile_key:
-            profile_key = "ch02"
-        elif profile_key not in _DEFAULT_CAMERA_PROFILES:
-            profile_key = "default"
+        )
+        profile_key = cls._profile_key(requested_profile)
 
         custom_profiles = {}
         for cam_k, cam_v in dir_cfg.get("cameras", {}).items():
@@ -172,7 +167,15 @@ class DirectionDetector:
                     virtual_line=vl,
                 )
 
-        line = VirtualLine.from_config(config)
+        # A camera's configured line is oriented to agree with its own IN
+        # vector. The global line is only a legacy fallback; using it for
+        # ch01/ch02 would override the camera-specific direction mapping.
+        profile = custom_profiles.get(profile_key)
+        line = (
+            profile.virtual_line
+            if profile and profile.virtual_line is not None
+            else VirtualLine.from_config(config)
+        )
 
         return cls(
             line=line,
@@ -187,11 +190,7 @@ class DirectionDetector:
 
     def set_camera_profile(self, profile_name: str) -> None:
         """Switch active camera profile at runtime."""
-        key = profile_name.lower()
-        if "01" in key or "main" in key:
-            key = "ch01"
-        elif "02" in key:
-            key = "ch02"
+        key = self._profile_key(profile_name)
 
         if key in self._profiles:
             self.camera_profile = key
@@ -201,6 +200,21 @@ class DirectionDetector:
             _logger.info("Direction detector switched to profile: %s (%s)", key, self._active_config.name)
         else:
             _logger.warning("Unknown camera profile %s; retaining %s", profile_name, self.camera_profile)
+
+    @staticmethod
+    def _profile_key(profile_name: str) -> str:
+        """Resolve channel names and stable camera IDs to direction profiles."""
+        key = str(profile_name).strip().lower()
+        if key in _DEFAULT_CAMERA_PROFILES:
+            return key
+        if "main" in key:
+            return "ch01"
+        match = re.search(r"(\d+)$", key)
+        if match:
+            channel = int(match.group(1))
+            if channel in (1, 2):
+                return f"ch{channel:02d}"
+        return "default"
 
     def update(
         self,
@@ -230,7 +244,12 @@ class DirectionDetector:
         # 2. Check virtual line crossing (provides instant crossing detection if configured)
         if prev is not None:
             line_cross = self._check_virtual_line(prev, centroid)
-            if line_cross is not None:
+            if (
+                line_cross is not None
+                and self._direction_for_vector(
+                    centroid[0] - prev[0], centroid[1] - prev[1]
+                ) == line_cross
+            ):
                 self._track_confirmed[track_id] = line_cross
                 return line_cross
 
@@ -249,25 +268,8 @@ class DirectionDetector:
         if displacement < self.min_displacement_px:
             return None
 
-        # 5. Compute unit movement vector
-        vx = dx / displacement
-        vy = dy / displacement
-
-        # 6. Measure alignment against active camera profile
-        in_vec = self._active_config.in_vector
-        out_vec = self._active_config.out_vector
-
-        dot_in = vx * in_vec[0] + vy * in_vec[1]
-        dot_out = vx * out_vec[0] + vy * out_vec[1]
-
-        # Classify current frame vote
-        if dot_in >= self.cos_threshold:
-            frame_vote = "IN"
-        elif dot_out >= self.cos_threshold:
-            frame_vote = "OUT"
-        else:
-            # Requirement 8: Ambiguous movement
-            frame_vote = "UNKNOWN"
+        # 6. Measure alignment against the active camera profile.
+        frame_vote = self._direction_for_vector(dx, dy)
 
         self._track_votes[track_id].append(frame_vote)
 
@@ -283,6 +285,20 @@ class DirectionDetector:
                 return "OUT"
 
         return None
+
+    def _direction_for_vector(self, dx: float, dy: float) -> str:
+        displacement = math.hypot(dx, dy)
+        if displacement < self.min_displacement_px:
+            return "UNKNOWN"
+        vx = dx / displacement
+        vy = dy / displacement
+        dot_in = vx * self._active_config.in_vector[0] + vy * self._active_config.in_vector[1]
+        dot_out = vx * self._active_config.out_vector[0] + vy * self._active_config.out_vector[1]
+        if dot_in >= self.cos_threshold:
+            return "IN"
+        if dot_out >= self.cos_threshold:
+            return "OUT"
+        return "UNKNOWN"
 
     def get_direction(self, track_id: int) -> str:
         """Return the confirmed direction for track_id, or estimated/UNKNOWN if unconfirmed."""

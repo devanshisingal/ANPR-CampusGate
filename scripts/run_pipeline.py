@@ -181,8 +181,30 @@ def _store_event(
 
     try:
         with database.get_session() as session:
-            database.insert_event(session, event_data)
+            inserted_event = database.insert_event(session, event_data)
+            if inserted_event is None:
+                log.error("Database did not persist event for %s", plate_number)
+                return False
         dup_filter.record(plate_number, track_id)
+        if progress is None:
+            try:
+                from src.alerts.blacklist import get_blacklist
+
+                blacklist_entry = get_blacklist().get(plate_number)
+            except Exception as exc:
+                log.error("Could not check blacklist for stored plate %s: %s", plate_number, exc)
+            else:
+                if blacklist_entry is not None:
+                    reason = (
+                        f" ({blacklist_entry['reason']})"
+                        if blacklist_entry.get("reason") else ""
+                    )
+                    log.warning(
+                        "ALERT: BLACKLISTED vehicle %s%s detected at %s",
+                        blacklist_entry["plate"],
+                        reason,
+                        camera_meta.get("camera_name") or camera_meta.get("camera_id") or "camera",
+                    )
         log.info(
             "✅ STORED: plate=%s type=%s color=%s class=%s body=%s dir=%s camera=%s conf=%s",
             plate_number, vehicle_type, color, vehicle_class, vehicle_color, direction,

@@ -1,6 +1,6 @@
 #  ALPR University Gate System
 
-A production-quality **Automatic License Plate Recognition (ALPR)** system built for university gate access monitoring. It detects vehicles in video streams, reads Indian license plates using a custom-trained YOLOv8m model + PaddleOCR, classifies vehicle types, and logs every entry/exit event to a SQLite database with a live Streamlit dashboard and REST API.
+A production-quality **Automatic License Plate Recognition (ALPR)** system built for university gate access monitoring. It detects vehicles in video streams, reads Indian license plates using a custom-trained YOLOv8m model + PaddleOCR, classifies vehicle types, and logs every entry/exit event to a SQLite database with a Next.js operations dashboard and REST API. The older Streamlit dashboards remain available as optional legacy tools.
 
 ---
 
@@ -18,7 +18,8 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 - [Usage — How to Run](#-usage--how-to-run)
 - [Training Your Own Model](#-training-your-own-model)
 - [API Reference](#-api-reference)
-- [Streamlit Dashboard](#-streamlit-dashboard)
+- [Next.js Dashboard](#-nextjs-dashboard)
+- [Legacy Streamlit Dashboards](#-legacy-streamlit-dashboards)
 - [Running Tests](#-running-tests)
 - [Model Performance](#-model-performance)
 - [Tech Stack](#-tech-stack)
@@ -39,7 +40,7 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 - Motion filter — only processes moving vehicles
 - Duplicate suppression — one entry per vehicle per 30-second window
 - Virtual line IN/OUT direction detection
-- SQLite database + FastAPI REST API + Streamlit live dashboard
+- SQLite database + FastAPI REST API + Next.js operations dashboard
 - CSV output mode for quick batch video processing
 
 ---
@@ -52,30 +53,42 @@ independently, with a trajectory engine that joins those sightings into an
 ordered, mapped path for any given vehicle.
 
 ```
-CAM001 India Gate ──┐
-CAM002 Connaught ───┤   processed SEQUENTIALLY,     ┌─▶ Trajectory engine
-CAM003 Karol Bagh ──┤   one camera at a time  ──────┤   (order · legs · GeoJSON)
+CAM001 Main Gate ───┐
+CAM002 Gate 2 ──────┤   recorded files sequentially ┌─▶ Trajectory engine
+CAM003 Karol Bagh ──┤   RTSP streams together      ─┤   (order · legs · GeoJSON)
 CAM004 Kashmere ────┘   into one shared database    └─▶ Leaflet map + timeline
 ```
 
-Quick start:
+Quick start (start the FastAPI API and Next.js frontend in separate terminals):
 
-```bash
-streamlit run src/dashboard/trajectory_app.py
-# per camera: upload a video OR set an RTSP URL (one or the other)
-# → START PROCESSING → search a plate → Trajectory tab
+```powershell
+# Terminal 1, repository root
+uvicorn src.api.server:app --host 0.0.0.0 --port 8000
+
+# Terminal 2
+Set-Location frontend
+npm i
+npm run dev
 ```
+
+Open `http://localhost:3000`. To use a non-default API address, set
+`ANPR_API_URL` before starting Next.js. The FastAPI root redirects to the
+frontend URL; set `NEXTJS_URL` if the deployed frontend is not at
+`http://localhost:3000`.
 
 - Cameras are configured in **`config/camera_config.yaml`** (id, name,
   latitude, longitude, video or RTSP source) — nothing is hardcoded.
+- CAM001 uses the **ch01** direction profile (lower-right IN, upper-left
+  OUT); CAM002 uses **ch02** (lower-left IN, upper-right OUT). Gate 2 has no
+  coordinates until it is surveyed.
 - Cameras are processed **strictly one at a time**: one GPU, and it keeps
   demo timestamps monotonic across the queue.
 - Every camera takes **one** source: an uploaded video **or** an RTSP stream.
   Both run through the same pipeline; switching is a one-field change with no
-  code changes. Live streams are sampled for a bounded time
-  (`processing.live_duration_seconds`, default 60 s) so the queue advances.
-- The single-gate pipeline, API and dashboard below are **unchanged** and
-  still work exactly as documented.
+  code changes. Recorded files run in order, while live RTSP feeds run
+  concurrently until processing is stopped.
+- The single-gate pipeline and API remain available; the primary operator
+  interface is now the Next.js dashboard described below.
 
 **Full documentation: [`docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md`](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md)**
 — architecture, data flow, database schema, trajectory engine, map engine,
@@ -134,7 +147,7 @@ Direction Detection    → src/utils/direction_detector.py       (virtual line c
 Database Storage       → src/database/db.py                    (SQLite via SQLAlchemy)
         │
         ▼
-API / Dashboard        → src/api/server.py + src/dashboard/app.py
+API / Dashboard        → src/api/server.py + frontend/app/
 ```
 
 ---
@@ -149,6 +162,10 @@ alpr-university-gate/
 ├── pytest.ini                       # Pytest configuration
 ├── conftest.py                      # Root-level test fixtures
 ├── .gitignore
+├── frontend/                         # Next.js operations dashboard
+│   ├── app/                          # Dashboard UI, pages, and styles
+│   ├── next.config.ts                # FastAPI proxy rewrites
+│   └── package.json                  # Frontend dependencies and scripts
 │
 ├── config/
 │   └── config.yaml                  # All configuration parameters (edit this)
@@ -550,16 +567,47 @@ Then open `http://localhost:8000/docs` for the interactive Swagger UI.
 
 ---
 
-### Option 6: Start the Streamlit dashboard
+### Option 6: Start the Next.js operations dashboard
+
+The dashboard includes the live multi-camera wall, feed-health indicators,
+date/direction-filtered events and statistics, recognition snapshots, access
+list management and blacklist alerts, source uploads/RTSP configuration,
+processing controls, and vehicle history with a route map.
+
+Start the API and frontend in separate terminals:
+
+```powershell
+# Terminal 1, repository root
+uvicorn src.api.server:app --host 0.0.0.0 --port 8000
+
+# Terminal 2
+Set-Location frontend
+npm i
+npm run dev
+```
+
+Open `http://localhost:3000`. The frontend proxies API, image, snapshot,
+stream, and map requests through Next.js to `ANPR_API_URL` (defaults to
+`http://127.0.0.1:8000`). For a production frontend use `npm run build` then
+`npm start`; set `ANPR_API_URL` and `NEXTJS_URL` for the deployment.
+
+### Option 7: Legacy Streamlit dashboards
 
 ```bash
 streamlit run src/dashboard/app.py
 ```
 
-Open `http://localhost:8501` in your browser. The dashboard auto-refreshes every 3 seconds and shows:
+Open `http://localhost:8501` in your browser. These optional legacy dashboards show:
 - Live event table (plate number, vehicle type, direction, timestamp)
 - Plate crop images
 - Detection statistics
+- Current Authorized / Blacklisted / Unknown status, with blacklist alerts
+- Date- and direction-filtered records and counters
+
+The Next.js dashboard shows every configured camera feed simultaneously.
+Per-camera status is based on the freshness of the annotated frames written by
+the running pipeline; an unconfigured or stale feed is shown as offline rather
+than being reported healthy because the API itself is reachable.
 
 ---
 
@@ -626,9 +674,21 @@ Start the server: `uvicorn src.api.server:app --host 0.0.0.0 --port 8000`
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/logs` | Returns all vehicle events ordered by timestamp |
-| `GET` | `/search?plate=KA02MN1828` | Search events by plate number (partial match) |
+| `GET` | `/logs?start_date=2026-11-10&end_date=2026-11-10&direction=IN` | Filter persisted events by local date and direction |
+| `GET` | `/search?plate=KA02MN1828&direction=OUT` | Search exact plate history with optional date/direction filters |
+| `GET` | `/stats?start_date=2026-11-10&end_date=2026-11-10` | Direction counters for the selected local date range (today by default) |
+| `GET` | `/trajectory-api/cameras/feeds` | Per-camera feed health and snapshot/MJPEG URLs |
+| `GET` | `/trajectory-api/cameras/{camera_id}/snapshot` | Latest annotated frame for one configured camera |
+| `GET` | `/trajectory-api/cameras/{camera_id}/stream` | MJPEG stream for one configured camera |
+| `GET/POST/DELETE` | `/access-control/whitelist` | List, add, or remove authorized plates |
+| `GET/POST/DELETE` | `/access-control/blacklist` | List, add, or remove blocked plates |
 | `POST` | `/entry` | Manually add a vehicle event |
+
+`GET /logs`, `/live`, `/search`, and `/vehicles/{plate}` include an
+`access_status` value (`Authorized`, `Blacklisted`, or `Unknown`) computed
+from the current campus whitelist and blacklist. `/stats` accepts the same
+`direction` filter (`IN`, `OUT`, `UNKNOWN`, or `ALL`); omit both date bounds
+for today's local totals, or use `all_time=true` for all-time totals.
 
 Example response from `GET /logs`:
 ```json
@@ -639,6 +699,7 @@ Example response from `GET /logs`:
     "vehicle_type": "Private",
     "plate_color": "White",
     "direction": "IN",
+    "access_status": "Authorized",
     "timestamp": "2026-05-03T05:20:51Z",
     "image_path": "data/plate_crops/KA02MN1828_20260503_052051.jpg",
     "camera_id": "GATE-01",
@@ -675,14 +736,34 @@ Full interactive docs at `http://localhost:8000/docs`.
 
 ---
 
-##  Streamlit Dashboard
+##  Next.js Dashboard
+
+The primary operator dashboard lives in `frontend/`. It uses the existing
+FastAPI event, camera, feed-health, processing, vehicle-profile, trajectory,
+and map endpoints. Whitelist and blacklist management is exposed through
+`/access-control/whitelist` and `/access-control/blacklist`.
+
+Install and run it with:
+
+```powershell
+Set-Location frontend
+npm i
+npm run dev
+```
+
+The backend must be running on port 8000, or `ANPR_API_URL` must point to the
+API server. The development server runs on port 3000 by default.
+
+---
+
+##  Legacy Streamlit Dashboards
 
 ```bash
 streamlit run src/dashboard/app.py
 ```
 
 - URL: `http://localhost:8501`
-- Auto-refreshes every 3 seconds
+- Optional alternative interface; the Next.js app is the primary frontend.
 - Shows: live event table, plate crop thumbnails, total count, IN/OUT breakdown,
   and the camera (id, name, coordinates) each event came from
 

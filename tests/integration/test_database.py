@@ -18,6 +18,8 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from src.database.db import (
+    get_event_stats,
+    get_filtered_events,
     get_all_events,
     init_db,
     insert_event,
@@ -186,3 +188,43 @@ class TestSearchEvents:
                     "series_type", "timestamp", "direction", "image_path"}
         for r in results:
             assert required.issubset(r.keys())
+
+
+class TestEventFilters:
+    def test_date_and_direction_filters_match_stats_and_records(self, mem_session):
+        from datetime import date, datetime, time
+
+        today = date.today()
+        local_timestamp = datetime.combine(today, time(hour=12)).astimezone().isoformat()
+        insert_event(mem_session, _sample_event(
+            plate_number="PLATE_IN", direction="IN", timestamp=local_timestamp,
+        ))
+        insert_event(mem_session, _sample_event(
+            plate_number="PLATE_OUT", direction="OUT", timestamp=local_timestamp,
+        ))
+        insert_event(mem_session, _sample_event(
+            plate_number="PLATE_OLD", direction="IN",
+            timestamp="2000-01-01T12:00:00+00:00",
+        ))
+
+        events = get_filtered_events(
+            mem_session, start_date=today, end_date=today, directions=["IN"]
+        )
+        stats = get_event_stats(
+            mem_session, start_date=today, end_date=today, directions=["IN"]
+        )
+        assert [event["plate_number"] for event in events] == ["PLATE_IN"]
+        assert stats["entries"] == 1
+        assert stats["exits"] == 0
+        assert stats["unique_vehicles"] == 1
+        assert stats["total_events"] == 1
+
+    def test_reversed_date_range_is_rejected(self, mem_session):
+        from datetime import date, timedelta
+
+        with pytest.raises(ValueError, match="start_date"):
+            get_filtered_events(
+                mem_session,
+                start_date=date.today(),
+                end_date=date.today() - timedelta(days=1),
+            )

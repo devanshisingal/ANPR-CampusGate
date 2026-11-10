@@ -67,6 +67,13 @@ cameras:
     video_path: "data/uploads/CAM001.mp4"
     order: 1
 
+  - camera_id: "CAM002"
+    camera_name: "Gate 2"
+    latitude: null
+    longitude: null
+    video_path: "data/uploads/CAM002.mp4"
+    order: 2
+
   - camera_id: "CAM003"
     camera_name: "Karol Bagh"
     latitude: 28.6519

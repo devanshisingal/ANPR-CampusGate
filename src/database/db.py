@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Generator, Optional
 from urllib.parse import urlparse
@@ -469,38 +469,115 @@ def _event_local_date(timestamp: str):
     return ts.astimezone().date()
 
 
-def get_daily_stats(session: Session) -> dict:
-    """Return today's traffic statistics.
+def _coerce_filter_date(value) -> Optional[date]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
-    "Today" means the local calendar day (what a human operator means by
-    it), even though events are stored with UTC timestamps
-    (datetime.now(timezone.utc).isoformat() -- see insert_event()). The
-    previous version compared local-date boundaries as plain strings
-    against those UTC timestamps with no timezone conversion, which is
-    wrong for roughly a third of the day (UTC and IST, for example, are
-    5.5 hours apart -- from local midnight until UTC's own midnight, an
-    event correctly stored for "today" sorts as "yesterday" against a
-    same-looking-but-wrong string boundary). Parsing to real datetimes and
-    comparing local calendar dates avoids the whole class of bug.
-    """
-    local_today = datetime.now().astimezone().date()
 
-    events = [
-        e for e in session.query(VehicleEvent).all()
-        if _event_local_date(e.timestamp) == local_today
-    ]
+def get_filtered_events(
+    session: Session,
+    *,
+    start_date=None,
+    end_date=None,
+    directions=None,
+    plate_search: Optional[str] = None,
+    plate_number: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> list[dict]:
+    """Return newest-first event records matching local dates and filters."""
+    first_day = _coerce_filter_date(start_date)
+    last_day = _coerce_filter_date(end_date)
+    if first_day and last_day and first_day > last_day:
+        raise ValueError("start_date must be on or before end_date")
 
-    in_count = sum(1 for e in events if e.direction == "IN")
-    out_count = sum(1 for e in events if e.direction == "OUT")
-    unique_vehicles = len(set(e.plate_number for e in events))
+    query = session.query(VehicleEvent)
+    if directions is not None:
+        selected = (
+            {directions.upper()}
+            if isinstance(directions, str)
+            else {str(item).upper() for item in directions}
+        )
+        if not selected:
+            return []
+        if not selected.issubset({"IN", "OUT", "UNKNOWN"}):
+            raise ValueError("directions must contain only IN, OUT, or UNKNOWN")
+        query = query.filter(VehicleEvent.direction.in_(selected))
+    if plate_number:
+        query = query.filter(VehicleEvent.plate_number == plate_number.upper())
+    elif plate_search and plate_search.strip():
+        query = query.filter(VehicleEvent.plate_number.ilike(f"%{plate_search.strip()}%"))
 
+    local_timezone = datetime.now().astimezone().tzinfo or timezone.utc
+    if first_day:
+        local_start = datetime.combine(
+            first_day, time.min, tzinfo=local_timezone
+        ).astimezone(timezone.utc)
+        query = query.filter(VehicleEvent.timestamp >= local_start.isoformat())
+    if last_day:
+        local_end = datetime.combine(
+            last_day + timedelta(days=1), time.min, tzinfo=local_timezone
+        ).astimezone(timezone.utc)
+        query = query.filter(VehicleEvent.timestamp < local_end.isoformat())
+
+    query = query.order_by(VehicleEvent.timestamp.desc())
+    if limit is not None:
+        query = query.limit(limit)
+    rows = query.all()
+    results = []
+    for row in rows:
+        if first_day or last_day:
+            event_date = _event_local_date(row.timestamp)
+            if event_date is None:
+                continue
+            if first_day and event_date < first_day:
+                continue
+            if last_day and event_date > last_day:
+                continue
+        results.append(row.to_dict())
+    return results
+
+
+def get_event_stats(
+    session: Session,
+    *,
+    start_date=None,
+    end_date=None,
+    directions=None,
+    default_today: bool = True,
+) -> dict:
+    """Return counts for the selected local date range and directions."""
+    today = datetime.now().astimezone().date()
+    first_day = _coerce_filter_date(start_date)
+    last_day = _coerce_filter_date(end_date)
+    if default_today and first_day is None and last_day is None:
+        first_day = last_day = today
+    events = get_filtered_events(
+        session,
+        start_date=first_day,
+        end_date=last_day,
+        directions=directions,
+        limit=None,
+    )
     return {
-        "date": local_today.isoformat(),
-        "entries": in_count,
-        "exits": out_count,
-        "unique_vehicles": unique_vehicles,
+        "date": (last_day or today).isoformat(),
+        "start_date": first_day.isoformat() if first_day else None,
+        "end_date": last_day.isoformat() if last_day else None,
+        "entries": sum(1 for event in events if event["direction"] == "IN"),
+        "exits": sum(1 for event in events if event["direction"] == "OUT"),
+        "unique_vehicles": len({event["plate_number"] for event in events}),
         "total_events": len(events),
     }
+
+
+def get_daily_stats(session: Session) -> dict:
+    """Return today's traffic statistics in the server's local timezone."""
+    local_today = datetime.now().astimezone().date()
+    return get_event_stats(session, start_date=local_today, end_date=local_today)
 
 
 def save_thumbnail(

@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add project root to path
@@ -140,27 +140,20 @@ def load_recent_events(
     """Load events from database applying direction, date range, and plate search filters."""
     try:
         with database.get_session() as session:
-            query = session.query(database.VehicleEvent)
-
-            # 1. Plate search filter
-            if plate_filter and plate_filter.strip():
-                clean_search = plate_filter.strip().upper()
-                query = query.filter(database.VehicleEvent.plate_number.like(f"%{clean_search}%"))
-
-            # 2. Direction filter
-            if direction_filter is not None:
-                if len(direction_filter) == 0:
-                    return []
-                if len(direction_filter) == 1:
-                    query = query.filter(database.VehicleEvent.direction == direction_filter[0].upper())
-
-            # 3. Date range filter
+            start_date = None
             if days:
-                cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
-                query = query.filter(database.VehicleEvent.timestamp >= cutoff_dt.isoformat())
-
-            events = query.order_by(database.VehicleEvent.timestamp.desc()).limit(limit).all()
-            return [e.to_dict() for e in events]
+                start_date = (
+                    datetime.now().astimezone().date()
+                    - timedelta(days=max(1, days) - 1)
+                )
+            return database.get_filtered_events(
+                session,
+                start_date=start_date,
+                end_date=datetime.now().astimezone().date() if days else None,
+                directions=direction_filter,
+                plate_search=plate_filter,
+                limit=limit,
+            )
     except Exception as exc:
         st.error(f"Failed to load events: {exc}")
         return []

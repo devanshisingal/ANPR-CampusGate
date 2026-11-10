@@ -8,6 +8,8 @@ Endpoints:
   GET  /stream         — Live annotated camera feed (MJPEG)
   GET  /snapshot       — Single current frame (JPEG)
   POST /clear          — Delete all stored events, images, and the live frame
+  GET/POST/DELETE /access-control/whitelist — Manage authorized vehicles
+  GET/POST/DELETE /access-control/blacklist — Manage blocked vehicles
 
 Run with:
   uvicorn src.api.server:app --host 0.0.0.0 --port 8000
@@ -18,14 +20,19 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.api.schemas import EntryRequest, EventResponse
+from src.api.schemas import (
+    BlacklistPlateRequest,
+    EntryRequest,
+    EventResponse,
+    WhitelistPlateRequest,
+)
 from src.database import db as database
 from src.database.vehicle_profiles import get_profile
 from src.utils.config import get_camera_metadata, load_config
@@ -94,6 +101,13 @@ app = FastAPI(
 )
 
 
+@app.get("/", include_in_schema=False)
+def frontend_redirect():
+    """Send browser visits to the separately hosted Next.js dashboard."""
+    frontend_url = os.getenv("NEXTJS_URL", "http://localhost:3000").rstrip("/")
+    return RedirectResponse(frontend_url)
+
+
 _live_frame_path = _REPO_ROOT / _config.get("api", {}).get("live_frame_path", "data/live_frame.jpg")
 _plate_crops_dir = _REPO_ROOT / _config.get("database", {}).get("image_save_path", "data/plate_crops/")
 _plate_crops_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +172,24 @@ def _resolve_event_camera(request: EntryRequest) -> dict:
     }
 
 
+def _event_with_access_status(event: dict) -> dict:
+    """Attach the current whitelist/blacklist classification to a stored event."""
+    from src.alerts.whitelist import classify_vehicle
+
+    enriched = dict(event)
+    enriched["access_status"] = classify_vehicle(event.get("plate_number"))["status"]
+    return enriched
+
+
+def _direction_filter(direction: str | None) -> list[str] | None:
+    if direction is None or not direction.strip() or direction.upper() == "ALL":
+        return None
+    normalized = direction.upper()
+    if normalized not in ("IN", "OUT", "UNKNOWN"):
+        raise HTTPException(status_code=400, detail="Direction must be IN, OUT, UNKNOWN, or ALL")
+    return [normalized]
+
+
 @app.post("/entry", response_model=EventResponse, status_code=201)
 def create_entry(request: EntryRequest):
     """Record a new vehicle entry/exit event."""
@@ -177,7 +209,7 @@ def create_entry(request: EntryRequest):
             event = database.insert_event(session, event_data)
             if event is None:
                 raise HTTPException(status_code=500, detail="Failed to insert event")
-            return EventResponse(**event.to_dict())
+            return EventResponse(**_event_with_access_status(event.to_dict()))
     except HTTPException:
         raise
     except RuntimeError as exc:
@@ -189,12 +221,27 @@ def create_entry(request: EntryRequest):
 
 
 @app.get("/logs", response_model=list[EventResponse])
-def get_logs():
-    """Return all vehicle events ordered by timestamp descending."""
+def get_logs(
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    direction: str | None = Query(None),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    """Return newest-first events, optionally filtered by local date and direction."""
     try:
         with database.get_session() as session:
-            events = database.get_all_events(session)
-            return [EventResponse(**e) for e in events]
+            events = database.get_filtered_events(
+                session,
+                start_date=start_date,
+                end_date=end_date,
+                directions=_direction_filter(direction),
+                limit=limit,
+            )
+            return [EventResponse(**_event_with_access_status(event)) for event in events]
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /logs: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -204,12 +251,28 @@ def get_logs():
 
 
 @app.get("/search", response_model=list[EventResponse])
-def search_by_plate(plate: str = Query(..., description="Plate number to search for")):
+def search_by_plate(
+    plate: str = Query(..., description="Plate number to search for"),
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    direction: str | None = Query(None),
+):
     """Search vehicle events by plate number."""
     try:
         with database.get_session() as session:
-            events = database.search_events(session, plate_number=plate)
-            return [EventResponse(**e) for e in events]
+            events = database.get_filtered_events(
+                session,
+                start_date=start_date,
+                end_date=end_date,
+                directions=_direction_filter(direction),
+                plate_number=plate,
+                limit=None,
+            )
+            return [EventResponse(**_event_with_access_status(event)) for event in events]
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /search: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -227,7 +290,7 @@ def get_events_by_direction(direction: str = Query(..., description="'IN' or 'OU
     try:
         with database.get_session() as session:
             events = database.get_events_by_direction(session, direction, limit=100)
-            return [EventResponse(**e) for e in events]
+            return [EventResponse(**_event_with_access_status(e)) for e in events]
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /direction: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -237,12 +300,27 @@ def get_events_by_direction(direction: str = Query(..., description="'IN' or 'OU
 
 
 @app.get("/stats")
-def get_traffic_statistics():
-    """Return today's traffic statistics."""
+def get_traffic_statistics(
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    direction: str | None = Query(None),
+    all_time: bool = Query(False),
+):
+    """Return traffic counts for the selected local date range and direction."""
     try:
         with database.get_session() as session:
-            stats = database.get_daily_stats(session)
+            stats = database.get_event_stats(
+                session,
+                start_date=start_date,
+                end_date=end_date,
+                directions=_direction_filter(direction),
+                default_today=not all_time,
+            )
             return stats
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /stats: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -268,7 +346,7 @@ def get_vehicle_history(plate: str):
                 "exits": sum(1 for e in events if e["direction"] == "OUT"),
                 "first_seen": events[-1]["timestamp"] if events else None,
                 "last_seen": events[0]["timestamp"] if events else None,
-                "events": events,
+                "events": [_event_with_access_status(event) for event in events],
                 # Added: the vehicle profile (class, colour, thumbnails,
                 # camera visits). Every key above is unchanged.
                 "profile": get_profile(session, plate),
@@ -284,16 +362,31 @@ def get_vehicle_history(plate: str):
 
 
 @app.get("/live")
-def get_live_feed(limit: int = Query(10, ge=1, le=100, description="Number of recent events")):
+def get_live_feed(
+    limit: int = Query(10, ge=1, le=100, description="Number of recent events"),
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    direction: str | None = Query(None),
+):
     """Return live feed of most recent events (auto-update on dashboard)."""
     try:
         with database.get_session() as session:
-            events = database.get_all_events(session, limit=limit)
+            events = database.get_filtered_events(
+                session,
+                start_date=start_date,
+                end_date=end_date,
+                directions=_direction_filter(direction),
+                limit=limit,
+            )
             return {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event_count": len(events),
-                "events": [EventResponse(**e) for e in events],
+                "events": [EventResponse(**_event_with_access_status(e)) for e in events],
             }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /live: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -412,18 +505,61 @@ async def get_stream():
     )
 
 
-# Multi-camera trajectory routes, all under /trajectory-api. Registered
-# before the "/" static mount below, since Starlette matches routes in
-# registration order and that mount is the catch-all.
+# Multi-camera trajectory routes, all under /trajectory-api.
 from src.api.trajectory_routes import router as trajectory_router  # noqa: E402
 
 app.include_router(trajectory_router)
 
 
-# Serves the dashboard's HTML/CSS/JS. Mounted last and at the root path so
-# every API route above (all under distinct paths like /logs, /search)
-# still matches first -- Starlette checks routes in the order they were
-# added, and this mount is the fallback for anything that isn't one of
-# them, including "/" itself (html=True serves index.html there).
-_dashboard_dir = Path(__file__).resolve().parents[1] / "dashboard_web"
-app.mount("/", StaticFiles(directory=str(_dashboard_dir), html=True), name="dashboard")
+@app.get("/access-control/whitelist")
+def list_whitelisted_vehicles():
+    from src.alerts.whitelist import get_whitelist
+
+    return get_whitelist().entries()
+
+
+@app.post("/access-control/whitelist", status_code=201)
+def add_whitelisted_vehicle(request: WhitelistPlateRequest):
+    from src.alerts.whitelist import get_whitelist
+
+    try:
+        plate = get_whitelist().add(request.plate, request.owner, request.category)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "Vehicle added to whitelist", "plate": plate}
+
+
+@app.delete("/access-control/whitelist/{plate}")
+def remove_whitelisted_vehicle(plate: str):
+    from src.alerts.whitelist import get_whitelist
+
+    if not get_whitelist().remove(plate):
+        raise HTTPException(status_code=404, detail=f"Plate {plate.upper()} is not whitelisted")
+    return {"message": "Vehicle removed from whitelist", "plate": plate.upper()}
+
+
+@app.get("/access-control/blacklist")
+def list_blacklisted_vehicles():
+    from src.alerts.blacklist import get_blacklist
+
+    return get_blacklist().entries()
+
+
+@app.post("/access-control/blacklist", status_code=201)
+def add_blacklisted_vehicle(request: BlacklistPlateRequest):
+    from src.alerts.blacklist import get_blacklist
+
+    try:
+        plate = get_blacklist().add(request.plate, request.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "Vehicle added to blacklist", "plate": plate}
+
+
+@app.delete("/access-control/blacklist/{plate}")
+def remove_blacklisted_vehicle(plate: str):
+    from src.alerts.blacklist import get_blacklist
+
+    if not get_blacklist().remove(plate):
+        raise HTTPException(status_code=404, detail=f"Plate {plate.upper()} is not blacklisted")
+    return {"message": "Vehicle removed from blacklist", "plate": plate.upper()}

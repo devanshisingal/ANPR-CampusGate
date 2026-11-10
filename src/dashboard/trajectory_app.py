@@ -737,6 +737,24 @@ def _estimate_remaining(cameras: list[dict]) -> Optional[float]:
     return remaining / rate
 
 
+def _live_frame_path(camera_id: str) -> Path:
+    directory = (_bootstrap()["config"].get("api") or {}).get(
+        "live_frames_dir", "data/live_frames"
+    )
+    path = Path(directory)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path / f"{camera_id}.jpg"
+
+
+def _live_frame_age_seconds(camera_id: str) -> Optional[float]:
+    """Return the age of this camera's most recent published frame."""
+    try:
+        return max(0.0, time.time() - _live_frame_path(camera_id).stat().st_mtime)
+    except OSError:
+        return None
+
+
 def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
     """Read a camera's latest annotated frame, or None if it has none yet.
 
@@ -748,13 +766,7 @@ def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
     Never raises -- the file is being rewritten underneath us, so a partial
     or vanished read is expected and simply means "no new frame this time".
     """
-    directory = (_bootstrap()["config"].get("api") or {}).get(
-        "live_frames_dir", "data/live_frames"
-    )
-    path = Path(directory)
-    if not path.is_absolute():
-        path = REPO_ROOT / path
-    frame = path / f"{camera_id}.jpg"
+    frame = _live_frame_path(camera_id)
     try:
         if not frame.is_file():
             return None
@@ -1018,16 +1030,24 @@ def render_camera_wall(status: dict) -> None:
             with column:
                 progress = progress_by_id.get(camera.camera_id)
                 state = progress["state"] if progress else CameraState.PENDING.value
-                color, label = _STATE_STYLE.get(state, ("#6b7280", state))
                 is_live = state == CameraState.RUNNING.value
+                frame = _live_frame_bytes(camera.camera_id)
+                frame_age = _live_frame_age_seconds(camera.camera_id)
+                stale_after = float(
+                    (_bootstrap()["config"].get("api") or {}).get(
+                        "live_frame_stale_seconds", 15.0
+                    )
+                )
+                feed_online = frame is not None and frame_age is not None and frame_age <= stale_after
+                feed_label = "ONLINE" if feed_online else "OFFLINE"
+                feed_color = "#16a34a" if feed_online else "#dc2626"
 
                 st.markdown(
                     f"**{camera.order}. {camera.camera_name}** "
-                    f"{_badge('LIVE' if is_live else label, '#dc2626' if is_live else color)}",
+                    f"{_badge(feed_label, feed_color)}",
                     unsafe_allow_html=True,
                 )
 
-                frame = _live_frame_bytes(camera.camera_id)
                 if frame:
                     any_frame = True
 

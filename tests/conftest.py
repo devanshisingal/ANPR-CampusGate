@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import yaml
 from hypothesis import HealthCheck, settings
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -115,6 +116,9 @@ def _test_camera_config(directory) -> str:
     would read the status of the operator's last real run (and write junk
     uploads into it).
     """
+    def yaml_path(value) -> str:
+        return yaml.safe_dump(str(value), default_style="'").strip()
+
     return "\n".join(
         ["defaults:",
          '  source_type: "upload"',
@@ -125,12 +129,12 @@ def _test_camera_config(directory) -> str:
            f'    camera_name: "{name}"\n'
            f"    latitude: {latitude}\n"
            f"    longitude: {longitude}\n"
-           f'    video_path: "{directory / (camera_id + ".mp4")}"\n'
+           f"    video_path: {yaml_path(directory / (camera_id + '.mp4'))}\n"
            f"    order: {order}\n"
            for camera_id, name, latitude, longitude, order in TEST_CAMERA_SITES]
         + ["processing:",
-           f'  upload_dir: "{directory / "uploads"}"',
-           f'  status_file: "{directory / "processing_status.json"}"',
+           f"  upload_dir: {yaml_path(directory / 'uploads')}",
+           f"  status_file: {yaml_path(directory / 'processing_status.json')}",
            "  continue_on_error: true",
            "",
            "trajectory:",

@@ -38,6 +38,17 @@ class EntryRequest(BaseModel):
     ocr_text:           Optional[str]   = None
 
 
+class WhitelistPlateRequest(BaseModel):
+    plate: str
+    owner: str = ""
+    category: str = "Authorized"
+
+
+class BlacklistPlateRequest(BaseModel):
+    plate: str
+    reason: str = ""
+
+
 class EventResponse(BaseModel):
     id:           int
     plate_number: str
@@ -47,6 +58,7 @@ class EventResponse(BaseModel):
     timestamp:    str
     direction:    str
     image_path:   str
+    access_status: str = "Unknown"
 
     # Nullable in the database, so nullable here: events recorded before
     # camera attribution existed have none, and a gate that hasn't been

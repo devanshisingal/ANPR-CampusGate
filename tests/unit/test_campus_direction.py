@@ -114,6 +114,39 @@ class TestCampusDirectionDetection(unittest.TestCase):
         self.assertEqual(dd.get_direction(track_id), "OUT")
         self.assertTrue(dd.is_confirmed(track_id))
 
+    def test_camera_id_selects_profile_and_profile_line(self):
+        config = {
+            "direction": {
+                "virtual_line": {"x1": 0, "y1": 360, "x2": 1280, "y2": 360},
+                "cameras": {
+                    "ch01": {
+                        "in_vector": [0.7071, 0.7071],
+                        "out_vector": [-0.7071, -0.7071],
+                        "virtual_line": {"x1": 200, "y1": 700, "x2": 900, "y2": 300},
+                    },
+                    "ch02": {
+                        "in_vector": [-0.7071, 0.7071],
+                        "out_vector": [0.7071, -0.7071],
+                        "virtual_line": {"x1": 100, "y1": 300, "x2": 800, "y2": 700},
+                    },
+                },
+            }
+        }
+
+        dd = DirectionDetector.from_config(config, camera_id="CAM002")
+        self.assertEqual(dd.camera_profile, "ch02")
+        self.assertEqual(dd.line, VirtualLine(100, 300, 800, 700))
+        for point in [(600.0, 200.0), (570.0, 230.0), (540.0, 260.0), (510.0, 290.0)]:
+            dd.update(203, point)
+        self.assertEqual(dd.get_direction(203), "IN")
+
+    def test_virtual_line_crossing_must_match_camera_direction(self):
+        line = VirtualLine(x1=0, y1=0, x2=100, y2=100)
+        dd = DirectionDetector(line=line, camera_profile="ch01")
+        dd.update(305, (20.0, 40.0))
+        self.assertIsNone(dd.update(305, (40.0, 20.0)))
+        self.assertEqual(dd.get_direction(305), "UNKNOWN")
+
     # -------------------------------------------------------------
     # Constraint & Edge-case Tests
     # -------------------------------------------------------------
