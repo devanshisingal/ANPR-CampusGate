@@ -27,7 +27,7 @@ import argparse
 import sys
 import time
 import statistics
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +62,42 @@ def _ensure_system_site_packages() -> None:
     ensure_system_site_packages()
 
 
+def _emit_blacklist_alert(
+    plate_number: str,
+    camera_meta: dict,
+    log,
+    progress=None,
+) -> bool:
+    """Emit an immediate blacklist warning via logger and/or ProgressReporter."""
+    if progress is not None:
+        on_alert = getattr(progress, "on_alert", None)
+        if callable(on_alert):
+            try:
+                return bool(on_alert(plate_number))
+            except Exception as exc:
+                log.debug("Progress reporter raised on_alert: %s", exc)
+    try:
+        from src.alerts.blacklist import get_blacklist
+
+        blacklist_entry = get_blacklist().get(plate_number)
+    except Exception as exc:
+        log.error("Could not check blacklist for plate %s: %s", plate_number, exc)
+        return False
+    if blacklist_entry is None:
+        return False
+    reason = (
+        f" ({blacklist_entry['reason']})"
+        if blacklist_entry.get("reason") else ""
+    )
+    log.warning(
+        "ALERT: BLACKLISTED vehicle %s%s detected at %s",
+        blacklist_entry["plate"],
+        reason,
+        camera_meta.get("camera_name") or camera_meta.get("camera_id") or "camera",
+    )
+    return True
+
+
 def _store_event(
     plate_number: str,
     series_type: str,
@@ -86,6 +122,7 @@ def _store_event(
     vehicle_color_detector=None,
     plate_thumbnail_source: np.ndarray | None = None,
     thumbnail_dir: str = "data/thumbnails",
+    alert_already_sent: bool = False,
 ) -> bool:
     """Classify, deduplicate, and store a confirmed plate event.
 
@@ -131,7 +168,8 @@ def _store_event(
 
     color = color_classifier.classify(plate_crop)
     vehicle_type = vehicle_classifier.classify(color)
-    direction = direction_detector.get_direction(track_id)
+    get_direction = getattr(direction_detector, "get_direction", None)
+    direction = get_direction(track_id) if callable(get_direction) else None
     if not direction or direction == "UNKNOWN":
         direction = direction_detector.update(track_id, centroid) or "UNKNOWN"
     image_path = database.save_plate_image(plate_crop, plate_number, image_save_path)
@@ -186,25 +224,12 @@ def _store_event(
                 log.error("Database did not persist event for %s", plate_number)
                 return False
         dup_filter.record(plate_number, track_id)
-        if progress is None:
-            try:
-                from src.alerts.blacklist import get_blacklist
-
-                blacklist_entry = get_blacklist().get(plate_number)
-            except Exception as exc:
-                log.error("Could not check blacklist for stored plate %s: %s", plate_number, exc)
-            else:
-                if blacklist_entry is not None:
-                    reason = (
-                        f" ({blacklist_entry['reason']})"
-                        if blacklist_entry.get("reason") else ""
-                    )
-                    log.warning(
-                        "ALERT: BLACKLISTED vehicle %s%s detected at %s",
-                        blacklist_entry["plate"],
-                        reason,
-                        camera_meta.get("camera_name") or camera_meta.get("camera_id") or "camera",
-                    )
+        if progress is None and not alert_already_sent:
+            _emit_blacklist_alert(
+                plate_number=plate_number,
+                camera_meta=camera_meta,
+                log=log,
+            )
         log.info(
             "✅ STORED: plate=%s type=%s color=%s class=%s body=%s dir=%s camera=%s conf=%s",
             plate_number, vehicle_type, color, vehicle_class, vehicle_color, direction,
@@ -220,6 +245,7 @@ def _store_event(
                     vehicle_image=vehicle_thumbnail_path or vehicle_image_path,
                     vehicle_class=vehicle_class,
                     vehicle_color=vehicle_color,
+                    alert_already_sent=alert_already_sent,
                 )
             except Exception as exc:
                 log.debug("Progress reporter raised on_detection: %s", exc)
@@ -274,7 +300,7 @@ def _draw_live_overlay(
 # ends in an atomic file write for the dashboard to poll, which is orders of
 # magnitude more expensive than a frame of bookkeeping -- so it happens a few
 # times a second, not thirty.
-_PROGRESS_EVERY_N_FRAMES = 10
+_PROGRESS_EVERY_N_FRAMES = 25
 
 
 def _probe_total_frames(source) -> int:
@@ -467,8 +493,13 @@ def run_pipeline(
         camera_meta["camera_id"], camera_meta["camera_name"],
         camera_meta["latitude"], camera_meta["longitude"],
     )
-    fusion_window   = int(fus_cfg.get("window_size", 5))
-    min_conf        = float(fus_cfg.get("min_confidence", 0.70))
+    fusion_window         = int(fus_cfg.get("window_size", 5))
+    min_conf              = float(fus_cfg.get("min_confidence", 0.70))
+    early_exit_votes      = max(1, int(fus_cfg.get("early_exit_votes", 2)))
+    early_exit_min_conf   = float(fus_cfg.get("early_exit_min_confidence", 0.80))
+    min_plate_width_px    = max(16, int(det_cfg.get("min_plate_width_px", 36)))
+    min_plate_height_px   = max(8, int(det_cfg.get("min_plate_height_px", 12)))
+    target_ocr_height_px  = max(0, int(config.get("preprocessing", {}).get("target_height_px", 64)))
 
     # A live source hands read_frame() whatever the newest camera frame is;
     # when per-frame work falls behind the camera's own rate, frame_capture.py
@@ -496,6 +527,8 @@ def run_pipeline(
     # camera's real frame rate. Only applies to live sources; a recorded
     # file keeps servicing every eligible track every frame, unchanged.
     live_max_heavy_tracks = max(1, int(config["tracking"].get("live_max_heavy_tracks_per_frame", 1)))
+    file_max_heavy_tracks = max(1, int(config["tracking"].get("max_heavy_tracks_per_frame", 2)))
+    max_heavy_tracks = live_max_heavy_tracks if frame_capture.is_live else file_max_heavy_tracks
     _heavy_rr_offset = 0
 
     api_cfg = config.get("api", {})
@@ -548,22 +581,28 @@ def run_pipeline(
 
     benchmark_recorder = BenchmarkRecorder() if benchmark else None
 
-    plate_detection_times: list[float] = []
+    plate_detection_times: deque[float] = deque(maxlen=2000)
+    plate_detection_sum_ms = 0.0
     plate_detection_calls = 0
     plate_detection_calls_per_track: dict[int, int] = defaultdict(int)
 
-    ocr_preprocess_times: list[float] = []
-    ocr_inference_times: list[float] = []
-    ocr_postprocess_times: list[float] = []
+    ocr_preprocess_times: deque[float] = deque(maxlen=2000)
+    ocr_inference_times: deque[float] = deque(maxlen=2000)
+    ocr_inference_sum_ms = 0.0
+    ocr_postprocess_times: deque[float] = deque(maxlen=2000)
     ocr_calls = 0
     ocr_calls_per_track: dict[int, int] = defaultdict(int)
+    track_fusion_votes: dict[int, int] = defaultdict(int)
 
     # per-track state
     track_plate_crops: dict[int, np.ndarray] = {}   # best raw plate crop
+    track_enhanced_crops: dict[int, np.ndarray] = {}
+    track_plate_areas: dict[int, int] = {}
     track_centroids:   dict[int, tuple]      = {}
     track_classes:     dict[int, str]        = {}   # YOLO class, for profiles
     track_vehicle_areas: dict[int, int]      = {}   # largest vehicle crop so far
     stored_tracks:     set[int]              = set()
+    alerted_tracks:    set[int]              = set()
 
     # dup_filter._plate_times / _track_times otherwise grow for the life of
     # the process (is_duplicate() only skips expired entries by time, it
@@ -662,12 +701,12 @@ def run_pipeline(
                         frames_processed=frames_processed,
                         fps=frames_processed / elapsed if elapsed > 0 else 0.0,
                         avg_ocr_ms=(
-                            sum(ocr_inference_times) / len(ocr_inference_times)
-                            if ocr_inference_times else 0.0
+                            ocr_inference_sum_ms / ocr_calls
+                            if ocr_calls else 0.0
                         ),
                         avg_detection_ms=(
-                            sum(plate_detection_times) / len(plate_detection_times)
-                            if plate_detection_times else 0.0
+                            plate_detection_sum_ms / plate_detection_calls
+                            if plate_detection_calls else 0.0
                         ),
                     )
                 except Exception as exc:
@@ -686,9 +725,10 @@ def run_pipeline(
                     time.perf_counter() - vehicle_detection_start
                 )
             if not detections:
+                vehicle_tracker.update([], frame)
                 if benchmark_recorder is not None:
                     benchmark_recorder.record_frame(time.perf_counter() - frame_start)
-                if live_frame_publisher is not None:
+                if live_frame_publisher is not None and live_frame_publisher.is_due():
                     live_frame_publisher.publish(frame)
                 continue
 
@@ -728,17 +768,18 @@ def run_pipeline(
 
                 eligible_tracks.append((track, vehicle_crop))
 
-            # Live source: only the chosen tracks get the expensive chain
-            # this frame; the rest get their turn on a later frame (see the
-            # live_max_heavy_tracks_per_frame comment earlier in this
-            # function). Recorded file: every eligible track, every frame,
-            # exactly as before.
-            if frame_capture.is_live and len(eligible_tracks) > live_max_heavy_tracks:
-                start = _heavy_rr_offset % len(eligible_tracks)
-                heavy_tracks = [
-                    eligible_tracks[(start + i) % len(eligible_tracks)]
-                    for i in range(live_max_heavy_tracks)
-                ]
+            # Cap expensive plate-detect + OCR work per frame across ALL sources,
+            # prioritizing tracks with the fewest fusion votes while rotating
+            # ties round-robin so newly-entered vehicles read quickly without
+            # starving other tracks when multiple cars appear at once.
+            if len(eligible_tracks) > max_heavy_tracks:
+                n = len(eligible_tracks)
+                start = _heavy_rr_offset % n
+                rotated = [eligible_tracks[(start + i) % n] for i in range(n)]
+                rotated.sort(
+                    key=lambda item: len(ocr_fusion._buffers.get(item[0].track_id, ()))
+                )
+                heavy_tracks = rotated[:max_heavy_tracks]
                 _heavy_rr_offset += 1
             else:
                 heavy_tracks = eligible_tracks
@@ -751,19 +792,27 @@ def run_pipeline(
                 plate_detection_calls_per_track[tid] += 1
                 plate_crops = plate_detector.detect(vehicle_crop)
                 plate_detection_elapsed = time.perf_counter() - plate_detection_start
-                plate_detection_times.append(plate_detection_elapsed * 1000.0)
+                plate_elapsed_ms = plate_detection_elapsed * 1000.0
+                plate_detection_times.append(plate_elapsed_ms)
+                plate_detection_sum_ms += plate_elapsed_ms
                 if benchmark_recorder is not None:
                     benchmark_recorder.record_plate_detection(plate_detection_elapsed)
                 if not plate_crops:
                     continue
 
                 plate_crop = plate_crops[0]
+                ph, pw = plate_crop.shape[:2]
+                if pw < min_plate_width_px or ph < min_plate_height_px:
+                    continue
 
-                # Save best crop for this track (used at fusion time).
-                # Store the raw plate_crop so the preprocessor can run fresh
-                # at fusion time (potentially with SR enhancement).
-                if tid not in track_plate_crops:
+                # Save largest raw plate crop for this track (archival thumbnail
+                # clarity + final-flush fallback), not just the first distant crop.
+                plate_area = ph * pw
+                is_best_plate = plate_area > track_plate_areas.get(tid, 0)
+                if is_best_plate:
+                    track_plate_areas[tid] = plate_area
                     track_plate_crops[tid] = plate_crop
+                if f"{tid}_vehicle" not in track_plate_crops:
                     track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
 
                 # For the vehicle profile, keep the LARGEST view of the vehicle
@@ -779,19 +828,22 @@ def run_pipeline(
                     track_vehicle_areas[tid] = vehicle_area
                     track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
 
-                # Preprocessing, including super-resolution on every attempt
-                # (not just once at fusion time) -- for a poor-quality camera
-                # source, a single enhance() at the end doesn't help the live
-                # OCR reads that feed fusion in the first place. Detection/OCR
-                # are now fast enough (single-digit ms) that this fits inside
-                # the per-frame budget; sr_enhancer.enhance() already no-ops
-                # above the configured sr_threshold_px, so this doesn't touch
-                # crops that are already large enough.
+                # Preprocessing + upscaling prior to OCR
                 preprocess_start = time.perf_counter()
-                preprocessed = plate_preprocessor.process(plate_crop)
+                ocr_plate_crop = plate_crop
+                if target_ocr_height_px > 0 and ph < target_ocr_height_px:
+                    scale_to_h = target_ocr_height_px / max(ph, 1)
+                    ocr_plate_crop = cv2.resize(
+                        plate_crop,
+                        (max(1, int(round(pw * scale_to_h))), target_ocr_height_px),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                preprocessed = plate_preprocessor.process(ocr_plate_crop)
                 ocr_input = sr_enhancer.enhance(preprocessed)
                 preprocess_elapsed = time.perf_counter() - preprocess_start
                 ocr_preprocess_times.append(preprocess_elapsed * 1000.0)
+                if is_best_plate:
+                    track_enhanced_crops[tid] = ocr_input
 
                 # OCR on upscaled preprocessed crop
                 ocr_calls += 1
@@ -799,7 +851,9 @@ def run_pipeline(
                 ocr_start = time.perf_counter()
                 raw_text, confidence = ocr_engine.recognize(ocr_input)
                 inference_elapsed = time.perf_counter() - ocr_start
-                ocr_inference_times.append(inference_elapsed * 1000.0)
+                inf_ms = inference_elapsed * 1000.0
+                ocr_inference_times.append(inf_ms)
+                ocr_inference_sum_ms += inf_ms
                 if benchmark_recorder is not None:
                     benchmark_recorder.record_ocr(inference_elapsed)
                 if not raw_text:
@@ -828,37 +882,37 @@ def run_pipeline(
                 if tid not in stored_tracks:
                     track_display_labels[tid] = (plate_number, False)
 
+                # Immediate pre-store blacklist alert on the first confident hit
+                if tid not in alerted_tracks and confidence >= max(min_conf, 0.70):
+                    if _emit_blacklist_alert(
+                        plate_number=plate_number,
+                        camera_meta=camera_meta,
+                        log=log,
+                        progress=progress,
+                    ):
+                        alerted_tracks.add(tid)
+
                 # Add to fusion buffer
                 ocr_fusion.add_result(tid, plate_number, confidence)
+                track_fusion_votes[tid] += 1
 
-                # Check if fusion window is full → emit result
-                buf = ocr_fusion._buffers.get(tid)
-                if buf and len(buf) >= fusion_window:
-                    result = ocr_fusion.flush(tid)
+                # Peek first; only flush & retire once fusion yields a storeable
+                # consensus (avoid wiping the sliding deque when a full window
+                # still lacks min_exact_votes).
+                if ocr_fusion.has_consensus(
+                    tid,
+                    early_exact_votes=early_exit_votes,
+                    min_consensus_conf=early_exit_min_conf,
+                ):
+                    result = ocr_fusion.get_result(tid)
                     if result:
                         fused_plate, fused_conf = result
                         plate_val, s_type = _validate_ocr_text(plate_validator, fused_plate)
                         if plate_val and fused_conf >= min_conf:
-                            # Apply SR on the best saved crop at fusion time
                             best_crop = track_plate_crops.get(tid, plate_crop)
                             color_crop = track_plate_crops.get(f"{tid}_vehicle", best_crop)
-                            best_preprocessed = plate_preprocessor.process(best_crop)
-                            enhanced_crop = sr_enhancer.enhance(best_preprocessed)
+                            enhanced_crop = track_enhanced_crops.get(tid, ocr_input)
 
-                            # Re-run OCR on SR-enhanced crop for final result
-                            sr_text, sr_conf = ocr_engine.recognize(enhanced_crop)
-                            if sr_text:
-                                sr_text = remove_noise_characters(sr_text)
-                                sr_plate, sr_series = _validate_ocr_text(plate_validator, sr_text)
-                                if sr_plate and sr_conf >= min_conf:
-                                    if sr_conf >= fused_conf:
-                                        plate_val = sr_plate
-                                        s_type = sr_series
-                                        log.info("Track %d: SR improved OCR → '%s' conf=%.2f",
-                                                 tid, plate_val, sr_conf)
-
-                            # Save the plate crop (prefer the SR-enhanced crop
-                            # for archival clarity) instead of the full vehicle image.
                             stored = _store_event(
                                 plate_number=plate_val,
                                 series_type=s_type,
@@ -887,12 +941,25 @@ def run_pipeline(
                                 vehicle_color_detector=vehicle_color_detector,
                                 plate_thumbnail_source=best_crop,
                                 thumbnail_dir=thumbnail_dir,
+                                alert_already_sent=(tid in alerted_tracks),
                             )
-                            if stored:
-                                events_stored += 1
-                                # Enforce strict once-per-track emission.
-                                # After this point, no further flush/store attempts for this tid.
+                            if stored or dup_filter.is_duplicate(plate_val, tid):
+                                if stored:
+                                    events_stored += 1
+                                # Enforce strict once-per-track emission (and retire
+                                # already-stored duplicates) so fragmented re-IDs
+                                # don't keep calling plate detection/OCR on every frame.
+                                ocr_fusion.flush(tid)
                                 stored_tracks.add(tid)
+                                track_plate_crops.pop(tid, None)
+                                track_plate_crops.pop(f"{tid}_vehicle", None)
+                                track_enhanced_crops.pop(tid, None)
+                                track_plate_areas.pop(tid, None)
+                                track_vehicle_areas.pop(tid, None)
+                                track_centroids.pop(tid, None)
+                                track_classes.pop(tid, None)
+                                track_fusion_votes.pop(tid, None)
+                                alerted_tracks.discard(tid)
                                 dir_label = direction_detector.get_direction(tid)
                                 display_str = f"{plate_val} [{dir_label}]" if dir_label != "UNKNOWN" else plate_val
                                 track_display_labels[tid] = (display_str, True)
@@ -919,11 +986,12 @@ def run_pipeline(
         for tid, (plate_number, confidence) in pending.items():
             if tid in stored_tracks:
                 continue
-            if not plate_number or confidence < min_conf * 0.9:
+            votes = track_fusion_votes.get(tid, 0)
+            if not plate_number or confidence < min_conf * 0.9 or votes < ocr_fusion.min_exact_votes:
                 log.info(
                     "Track %d: dropped at final flush (fused_plate=%r confidence=%.2f "
-                    "below threshold %.2f, or fusion had too few matching votes)",
-                    tid, plate_number, confidence, min_conf * 0.9,
+                    "votes=%d min_votes=%d)",
+                    tid, plate_number, confidence, votes, ocr_fusion.min_exact_votes,
                 )
                 continue
             plate_val, s_type = _validate_ocr_text(plate_validator, plate_number)
@@ -961,6 +1029,7 @@ def run_pipeline(
                 vehicle_color_detector=vehicle_color_detector,
                 plate_thumbnail_source=best_crop,
                 thumbnail_dir=thumbnail_dir,
+                alert_already_sent=(tid in alerted_tracks),
             ):
                 events_stored += 1
 

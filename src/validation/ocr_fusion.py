@@ -97,6 +97,48 @@ class OCRFusion:
             return None
         return self._fuse(list(buf))
 
+    def has_consensus(
+        self,
+        track_id: int,
+        *,
+        early_exact_votes: int = 2,
+        min_consensus_conf: float = 0.75,
+    ) -> bool:
+        """Return True when buffered reads already justify flushing this track.
+
+        Triggers either when the sliding window is full or when *early_exact_votes*
+        (and at least ``min_exact_votes``) identical reads form an uncontested,
+        high-confidence majority.
+        """
+        buf = self._buffers.get(track_id)
+        if not buf:
+            return False
+        if len(buf) >= self.window_size:
+            return True
+        required_votes = max(self.min_exact_votes, early_exact_votes)
+        if len(buf) < required_votes:
+            return False
+
+        plate_confs: Dict[str, List[float]] = {}
+        for plate, conf in buf:
+            plate_confs.setdefault(plate, []).append(conf)
+
+        best_plate, confs = max(
+            plate_confs.items(),
+            key=lambda item: (len(item[1]), sum(item[1])),
+        )
+        if len(confs) < required_votes:
+            return False
+
+        avg_conf = sum(confs) / len(confs)
+        if max(confs) < min_consensus_conf and avg_conf < min_consensus_conf:
+            return False
+
+        for other_plate, other_confs in plate_confs.items():
+            if other_plate != best_plate and len(other_confs) >= len(confs):
+                return False
+        return True
+
     def active_track_ids(self) -> List[int]:
         return [tid for tid, buf in self._buffers.items() if buf]
 

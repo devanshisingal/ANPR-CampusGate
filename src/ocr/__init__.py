@@ -15,6 +15,24 @@ from src.utils.logger import get_logger
 _logger = get_logger("ocr")
 
 
+def _build_rapidocr_engine(ocr_cfg: dict) -> OCREngine:
+    """Construct RapidOCREngine with tuned CPU/DBNet defaults from config."""
+    from src.ocr.rapidocr_engine import RapidOCREngine
+
+    rapid_cfg = ocr_cfg.get("rapidocr", {})
+    return RapidOCREngine(
+        text_score=float(rapid_cfg.get("text_score", 0.5)),
+        use_det=bool(rapid_cfg.get("use_det", True)),
+        use_cls=bool(rapid_cfg.get("use_cls", False)),
+        use_rec=bool(rapid_cfg.get("use_rec", True)),
+        det_limit_type=str(rapid_cfg.get("det_limit_type", "max")),
+        det_limit_side_len=int(rapid_cfg.get("det_limit_side_len", 320)),
+        det_border_pad=int(rapid_cfg.get("det_border_pad", 16)),
+        intra_op_num_threads=int(rapid_cfg.get("intra_op_num_threads", 4)),
+        inter_op_num_threads=int(rapid_cfg.get("inter_op_num_threads", 1)),
+    )
+
+
 def create_ocr_engine(backend: str, config: dict) -> OCREngine:
     """Instantiate the OCR engine specified by *backend*.
 
@@ -24,14 +42,7 @@ def create_ocr_engine(backend: str, config: dict) -> OCREngine:
     ocr_cfg = config.get("ocr", {})
 
     if backend == "rapidocr":
-        from src.ocr.rapidocr_engine import RapidOCREngine
-        rapid_cfg = ocr_cfg.get("rapidocr", {})
-        return RapidOCREngine(
-            text_score=float(rapid_cfg.get("text_score", 0.5)),
-            use_det=bool(rapid_cfg.get("use_det", True)),
-            use_cls=bool(rapid_cfg.get("use_cls", True)),
-            use_rec=bool(rapid_cfg.get("use_rec", True)),
-        )
+        return _build_rapidocr_engine(ocr_cfg)
 
     elif backend in {"tensorrt", "parseq_tensorrt"}:
         import importlib.util
@@ -41,14 +52,7 @@ def create_ocr_engine(backend: str, config: dict) -> OCREngine:
                 "TensorRT Python bindings are unavailable; falling back to RapidOCR for OCR. "
                 "Install TensorRT or switch config['ocr']['backend'] to 'rapidocr'."
             )
-            from src.ocr.rapidocr_engine import RapidOCREngine
-            rapid_cfg = ocr_cfg.get("rapidocr", {})
-            return RapidOCREngine(
-                text_score=float(rapid_cfg.get("text_score", 0.5)),
-                use_det=bool(rapid_cfg.get("use_det", True)),
-                use_cls=bool(rapid_cfg.get("use_cls", True)),
-                use_rec=bool(rapid_cfg.get("use_rec", True)),
-            )
+            return _build_rapidocr_engine(ocr_cfg)
 
         from src.ocr.parseq_tensorrt_engine import PARSeqTensorRTOCREngine
         parseq_cfg = ocr_cfg.get("parseq", {})

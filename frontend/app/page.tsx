@@ -175,6 +175,7 @@ function accessClass(status?: string) {
 }
 
 function App() {
+  const [mounted, setMounted] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>("Overview");
   const [startDate, setStartDate] = useState(localDate(new Date()));
   const [endDate, setEndDate] = useState(localDate(new Date()));
@@ -253,6 +254,9 @@ function App() {
     }
   }, []);
 
+  const processingState = processing.state;
+  const isProcessing = processingState === "running";
+
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -268,20 +272,56 @@ function App() {
       }
     };
     void load();
-    const timer = window.setInterval(() => {
-      void refresh().catch((reason: unknown) => {
+    return () => {
+      active = false;
+    };
+  }, [refresh, refreshAccessLists]);
+
+  useEffect(() => {
+    let active = true;
+    const pollTick = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        if (isProcessing) {
+          await refresh();
+          return;
+        }
+        const nextProcessing = await request<ProcessingStatus>("/trajectory-api/processing/status");
+        if (!active) return;
+        setProcessing(nextProcessing);
+        if (nextProcessing.state === "running" || nextProcessing.state !== processingState) {
+          await refresh();
+        }
+      } catch (reason: unknown) {
         if (active) {
           setApiConnected(false);
           setDatabaseConnected(false);
           setError(reason instanceof Error ? reason.message : "Dashboard refresh failed");
         }
-      });
-    }, 5000);
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void pollTick();
+    }, isProcessing ? 4000 : 15000);
+
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && !document.hidden) {
+        void refresh().catch(() => {});
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+
     return () => {
       active = false;
       window.clearInterval(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
     };
-  }, [refresh, refreshAccessLists]);
+  }, [refresh, isProcessing, processingState]);
 
   useEffect(() => {
     if (activeTab === "Settings") void loadSettings();
@@ -382,9 +422,17 @@ function App() {
     );
   }
 
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
   function navigate(tab: Tab) {
     setActiveTab(tab);
     setError("");
+  }
+
+  if (!mounted) {
+    return <main className="app-shell" />;
   }
 
   return (

@@ -108,6 +108,31 @@ class ProgressReporter:
         self._progress.avg_detection_ms = round(float(avg_detection_ms), 2)
         self._publish()
 
+    def _lookup_blacklist_alert(self, plate_number: str) -> Optional[str]:
+        try:
+            from src.alerts.blacklist import get_blacklist
+
+            entry = get_blacklist().get(plate_number)
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        reason = f" ({entry['reason']})" if entry.get("reason") else ""
+        return (
+            f"ALERT: BLACKLISTED vehicle {entry['plate']}{reason} detected at "
+            f"{self._progress.camera_name}"
+        )
+
+    def on_alert(self, plate_number: str) -> bool:
+        """Emit a blacklist alert immediately before full-window storage."""
+        message = self._lookup_blacklist_alert(plate_number)
+        if message is None:
+            return False
+        _logger.warning(message)
+        self._log(message)
+        self._publish()
+        return True
+
     def on_detection(
         self,
         plate_number: str,
@@ -116,6 +141,7 @@ class ProgressReporter:
         vehicle_image: Optional[str] = None,
         vehicle_class: Optional[str] = None,
         vehicle_color: Optional[str] = None,
+        alert_already_sent: bool = False,
         **_ignored,
     ) -> None:
         # **_ignored: the pipeline calls this with keyword arguments, and a
@@ -123,19 +149,13 @@ class ProgressReporter:
         # silently drops the detection from the live panel.
         self._progress.last_vehicle_class = vehicle_class
         self._progress.last_vehicle_color = vehicle_color
-        # Blacklist alert, raised the moment the plate is stored.
-        try:
-            from src.alerts.blacklist import get_blacklist
-
-            entry = get_blacklist().get(plate_number)
-        except Exception:
-            entry = None
-        if entry is not None:
-            reason = f" ({entry['reason']})" if entry.get("reason") else ""
-            message = (f"ALERT: BLACKLISTED vehicle {entry['plate']}{reason} detected at "
-                       f"{self._progress.camera_name}")
-            _logger.warning(message)
-            self._log(message)
+        # Blacklist alert, raised the moment the plate is stored unless an
+        # early pre-store alert already fired for this track.
+        if not alert_already_sent:
+            message = self._lookup_blacklist_alert(plate_number)
+            if message is not None:
+                _logger.warning(message)
+                self._log(message)
         self._progress.detections += 1
         self._plates.add(plate_number)
         self._progress.unique_plates = len(self._plates)

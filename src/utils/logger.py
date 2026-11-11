@@ -58,7 +58,7 @@ def get_logger(name: str, config: Optional[dict] = None) -> logging.Logger:
 
     # Console handler — INFO and above
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
     # Rotating file handler — all levels
@@ -68,7 +68,7 @@ def get_logger(name: str, config: Optional[dict] = None) -> logging.Logger:
         backupCount=backup_count,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
     logger.addHandler(console_handler)

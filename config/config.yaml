@@ -58,15 +58,17 @@ detection:
   vehicle_model_path: "models/vehicle_detector/yolov8n.onnx"
   vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
   vehicle_imgsz: 480                       # full-frame detection; 480 balances speed/recall
-  plate_model_path: "models/plate_detector/best.pt"
-  plate_confidence: 0.4                    # Back to conservative
+  plate_model_path: "models/plate_detector/best_finetuned.onnx"
+  plate_confidence: 0.28                   # Tuned for single best_finetuned.onnx recall
   plate_imgsz: 320                         # plate search is within an already-localized vehicle crop
+  min_plate_width_px: 36                   # skip blurry specks smaller than 36x12 before OCR
+  min_plate_height_px: 12
 
   # -- Ensemble Fusion --------------------------------------------------------
-  # Run baseline and fine-tuned models simultaneously and fuse plate boxes.
-  # If best_finetuned.pt is not yet downloaded, it automatically uses best.pt.
+  # Disabled in normal operation per user performance setup; single
+  # best_finetuned.onnx runs ~6.3x faster than the dual-.pt ensemble.
   plate_ensemble:
-    enabled: true
+    enabled: false
     models:
       - "models/plate_detector/best.pt"
       - "models/plate_detector/best_finetuned.pt"
@@ -101,6 +103,7 @@ tracking:
   # simultaneous-vehicle count still fits your frame budget at the higher
   # value.
   live_max_heavy_tracks_per_frame: 1
+  max_heavy_tracks_per_frame: 2            # cap heavy plate-detect+OCR tracks/frame on recorded clips too
 
 preprocessing:
   clahe_clip_limit: 2.0                    # Balanced for speed
@@ -113,13 +116,15 @@ preprocessing:
   # feed with real day/night/glare variance; a recorded, evenly-lit video
   # won't visibly change since well-exposed crops are left alone.
   adaptive_lighting: true
+  # Upscale small plate crops to at least this height before CLAHE/sharpening
+  # so PP-OCRv4 receives clean ~64px tall glyphs instead of post-blur 4x bloat.
+  target_height_px: 64
 
 enhancement:
-  # sr_threshold_px: plates narrower than this (px) get upscaled before OCR.
-  # On Jetson 7.2: Real-ESRGAN is unavailable (no PyTorch wheel yet) so
-  # OpenCV INTER_CUBIC upscale is used automatically — still helpful.
-  # Set to 0 to disable upscaling entirely.
-  sr_threshold_px: 180
+  # sr_threshold_px: disabled (0) on CPU when preprocessing.target_height_px
+  # handles upscaling prior to CLAHE/unsharp; set to 80-120 only when
+  # Real-ESRGAN weights are active on GPU.
+  sr_threshold_px: 0
   realesrgan_model_path: "models/realesrgan/RealESRGAN_x4plus.pth"
 
 ocr:
@@ -129,15 +134,20 @@ ocr:
   # PARSeq TensorRT is available for GPU inference/experiments.
   backend: "rapidocr"
 
-  # ── RapidOCR (Phase 1 — active) ───────────────────────────────────────────
-  # Runs PP-OCRv3/v4 ONNX models via onnxruntime (CPU on JetPack 7.2).
-  # No PaddlePaddle dependency. ~80–120ms/crop on Jetson Orin Nano CPU.
-  # OCRFusion window of 5 frames compensates for the slower per-frame latency.
+  # ── RapidOCR (CPU-tuned) ──────────────────────────────────────────────────
+  # det_limit_type='max' + det_limit_side_len=320 stops DBNet from upscaling
+  # small crops up to 736px short-side (~29x measured OCR speedup on CPU)
+  # while keeping 2-line Indian plate detection and blurry-crop filtering.
   rapidocr:
-    text_score: 0.5       # minimum confidence per text region (0.4–0.6)
-    use_det: true         # text region detection inside crop (recommended)
-    use_cls: true         # angle classifier — handles rotated/upside-down plates
-    use_rec: true         # recognition (always true)
+    text_score: 0.5          # minimum confidence per text region (0.4–0.6)
+    use_det: true            # keep True for 2-line plates and blurry-crop gating
+    use_cls: false           # skip angle classifier pass on upright gate cameras
+    use_rec: true            # recognition (always true)
+    det_limit_type: "max"
+    det_limit_side_len: 320
+    det_border_pad: 16       # replicated margin so DBNet detects tight crop edges
+    intra_op_num_threads: 4
+    inter_op_num_threads: 1
 
   # ── TensorRT PARSeq ──────────────────────────────────────────────────────
   # GPU inference. The wrapper chooses TensorRT 10's named-tensor API or
@@ -169,7 +179,7 @@ ocr:
 
 fusion:
   window_size: 5                           # majority vote over 5 reads for accuracy
-  min_confidence: 0.55                     # minimum confidence threshold
+  min_confidence: 0.60                     # minimum confidence threshold
   # Was 3 when using the un-fine-tuned PARSeq model (noisy per-frame reads,
   # needed extra repeats to trust a plate). The fine-tuned model now reads
   # at 0.95-1.00 confidence consistently, so 3 identical votes is often
@@ -177,6 +187,8 @@ fusion:
   # which silently drops an otherwise-correct plate. 2 is enough given the
   # model's now much lower per-frame error rate.
   min_exact_votes: 2
+  early_exit_votes: 3                      # flush early once 3 uncontested reads agree
+  early_exit_min_confidence: 0.82          # confidence required for early-exit flush
 
 deduplication:
   window_seconds: 30
@@ -250,12 +262,9 @@ motion_filter:
   # per frame, so displacement per frame is slightly higher than with SR.
   min_displacement_px: 3.0
   history_frames: 3
-  # Set to false when testing against a stationary target (e.g. a video
-  # played on a phone/laptop screen held up to the camera) -- a real
-  # vehicle's spatial displacement never happens there, so this filter
-  # would otherwise silently block plate detection/OCR for it entirely.
-  # Set back to true for real deployment (ignores parked/stationary vehicles).
-  enabled: false
+  # Enabled by default for real traffic (skips parked/stationary vehicles).
+  # Set to false only when testing against a stationary phone/screen target.
+  enabled: true
 
 database:
   path: "data/alpr.db"

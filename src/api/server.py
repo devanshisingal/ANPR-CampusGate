@@ -181,6 +181,25 @@ def _event_with_access_status(event: dict) -> dict:
     return enriched
 
 
+def _events_with_access_status(events: list[dict]) -> list[dict]:
+    """Attach whitelist/blacklist status to a list with one file check per list."""
+    if not events:
+        return []
+    from src.alerts.blacklist import normalize_plate
+    from src.alerts.whitelist import classify_status_batch
+
+    statuses = classify_status_batch(event.get("plate_number") for event in events)
+    return [
+        {
+            **event,
+            "access_status": statuses.get(
+                normalize_plate(event.get("plate_number")), "Unknown"
+            ),
+        }
+        for event in events
+    ]
+
+
 def _direction_filter(direction: str | None) -> list[str] | None:
     if direction is None or not direction.strip() or direction.upper() == "ALL":
         return None
@@ -237,7 +256,7 @@ def get_logs(
                 directions=_direction_filter(direction),
                 limit=limit,
             )
-            return [EventResponse(**_event_with_access_status(event)) for event in events]
+            return [EventResponse(**event) for event in _events_with_access_status(events)]
     except HTTPException:
         raise
     except ValueError as exc:
@@ -268,7 +287,7 @@ def search_by_plate(
                 plate_number=plate,
                 limit=None,
             )
-            return [EventResponse(**_event_with_access_status(event)) for event in events]
+            return [EventResponse(**event) for event in _events_with_access_status(events)]
     except HTTPException:
         raise
     except ValueError as exc:
@@ -290,7 +309,7 @@ def get_events_by_direction(direction: str = Query(..., description="'IN' or 'OU
     try:
         with database.get_session() as session:
             events = database.get_events_by_direction(session, direction, limit=100)
-            return [EventResponse(**_event_with_access_status(e)) for e in events]
+            return [EventResponse(**event) for event in _events_with_access_status(events)]
     except RuntimeError as exc:
         _logger.error("Database unavailable on GET /direction: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -346,7 +365,7 @@ def get_vehicle_history(plate: str):
                 "exits": sum(1 for e in events if e["direction"] == "OUT"),
                 "first_seen": events[-1]["timestamp"] if events else None,
                 "last_seen": events[0]["timestamp"] if events else None,
-                "events": [_event_with_access_status(event) for event in events],
+                "events": _events_with_access_status(events),
                 # Added: the vehicle profile (class, colour, thumbnails,
                 # camera visits). Every key above is unchanged.
                 "profile": get_profile(session, plate),
@@ -381,7 +400,7 @@ def get_live_feed(
             return {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event_count": len(events),
-                "events": [EventResponse(**_event_with_access_status(e)) for e in events],
+                "events": [EventResponse(**event) for event in _events_with_access_status(events)],
             }
     except HTTPException:
         raise

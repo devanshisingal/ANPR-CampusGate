@@ -118,11 +118,31 @@ def _get_engine() -> TrajectoryEngine:
     return TrajectoryEngine.from_registry(_get_registry())
 
 
+_feed_settings_cache: Optional[tuple[tuple[int, int, int], tuple[dict, Path, Path, Optional[str]]]] = None
+
+
 def _feed_settings() -> tuple[dict, Path, Path, Optional[str]]:
     """Resolve shared frame/status paths relative to the repository root."""
+    global _feed_settings_cache
     from src.utils.config import load_config
 
-    config = load_config(str(_REPO_ROOT / "config" / "config.yaml"))
+    config_path = _REPO_ROOT / "config" / "config.yaml"
+    try:
+        config_mtime = config_path.stat().st_mtime_ns
+    except OSError:
+        config_mtime = 0
+    registry = _get_registry()
+    reg_path = getattr(registry, "source_path", None)
+    try:
+        reg_mtime = Path(reg_path).stat().st_mtime_ns if reg_path else 0
+    except OSError:
+        reg_mtime = 0
+    status_file_cfg = str(registry.processing.get("status_file", ""))
+    cache_key = (config_mtime, reg_mtime, id(registry), status_file_cfg)
+    if _feed_settings_cache is not None and _feed_settings_cache[0] == cache_key:
+        return _feed_settings_cache[1]
+
+    config = load_config(str(config_path))
     api_config = config.get("api") or {}
 
     def resolve(value: str) -> Path:
@@ -130,15 +150,17 @@ def _feed_settings() -> tuple[dict, Path, Path, Optional[str]]:
         return path if path.is_absolute() else _REPO_ROOT / path
 
     frames_dir = resolve(api_config.get("live_frames_dir", "data/live_frames"))
-    status_path = resolve(_get_registry().processing.get(
+    status_path = resolve(registry.processing.get(
         "status_file", "data/processing_status.json"
     ))
     camera = config.get("camera") or {}
     configured_camera_id = camera.get("camera_id")
-    return (
+    result = (
         api_config, frames_dir, status_path,
         str(configured_camera_id) if configured_camera_id else None,
     )
+    _feed_settings_cache = (cache_key, result)
+    return result
 
 
 def _camera_frame_path(
@@ -177,9 +199,15 @@ def camera_feed_status():
     for camera in _get_registry():
         frame_path = _camera_frame_path(camera.camera_id, settings)
         try:
-            modified_at = frame_path.stat().st_mtime
-            frame_data = frame_path.read_bytes()
-            if not (frame_data.startswith(b"\xff\xd8") and frame_data.endswith(b"\xff\xd9")):
+            stat_result = frame_path.stat()
+            modified_at = stat_result.st_mtime
+            if stat_result.st_size < 4:
+                raise OSError("camera frame is not a complete JPEG")
+            with frame_path.open("rb") as frame_file:
+                header = frame_file.read(2)
+                frame_file.seek(-2, 2)
+                trailer = frame_file.read(2)
+            if header != b"\xff\xd8" or trailer != b"\xff\xd9":
                 raise OSError("camera frame is not a complete JPEG")
             age = max(0.0, now - modified_at)
             online = camera.enabled and age <= stale_after

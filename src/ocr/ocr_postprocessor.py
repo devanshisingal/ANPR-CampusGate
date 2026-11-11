@@ -39,6 +39,7 @@ LETTER_LIKE_DIGITS = {
     "8": "B",
     "6": "G",
     "2": "Z",
+    "9": "O",
 }
 
 # Visually similar letter pairs in Indian plates (common OCR confusions)
@@ -77,38 +78,25 @@ def correct_ocr_text(raw_text: str) -> str:
 
     chars = list(cleaned)
 
-    # Positions 0-1: LETTERS (state code)
+    # Positions 0-1: LETTERS (state code or 'BH')
     for i in [0, 1]:
-        if chars[i] in DIGIT_LIKE_LETTERS:
-            chars[i] = DIGIT_LIKE_LETTERS[chars[i]]
-
-    # Positions 2-3: DIGITS (district code)
-    for i in [2, 3]:
         if chars[i] in LETTER_LIKE_DIGITS:
             chars[i] = LETTER_LIKE_DIGITS[chars[i]]
-        # Also fix common digit confusions
-        if chars[i] == "O":
-            chars[i] = "0"
-        if chars[i] == "I" or chars[i] == "L":
-            chars[i] = "1"
+
+    # Positions 2-3: DIGITS (district / BH year code)
+    for i in [2, 3]:
+        if chars[i] in DIGIT_LIKE_LETTERS:
+            chars[i] = DIGIT_LIKE_LETTERS[chars[i]]
 
     # Positions 4-5: LETTERS (series)
     for i in [4, 5]:
-        if chars[i] in DIGIT_LIKE_LETTERS:
-            chars[i] = DIGIT_LIKE_LETTERS[chars[i]]
+        if chars[i] in LETTER_LIKE_DIGITS:
+            chars[i] = LETTER_LIKE_DIGITS[chars[i]]
 
     # Positions 6-9: DIGITS (registration number)
     for i in [6, 7, 8, 9]:
-        if chars[i] in LETTER_LIKE_DIGITS:
-            chars[i] = LETTER_LIKE_DIGITS[chars[i]]
-        if chars[i] == "O":
-            chars[i] = "0"
-        if chars[i] == "I" or chars[i] == "L":
-            chars[i] = "1"
-        if chars[i] == "S":
-            chars[i] = "5"
-        if chars[i] == "B":
-            chars[i] = "8"
+        if chars[i] in DIGIT_LIKE_LETTERS:
+            chars[i] = DIGIT_LIKE_LETTERS[chars[i]]
 
     return "".join(chars)
 

@@ -290,7 +290,13 @@ def main():
             st.write(f"**Gate Name:** {cam_meta.get('camera_name', 'Main Gate')}")
             st.write(f"**Camera ID:** `{cam_meta.get('camera_id', 'GATE-01')}`")
             st.write(f"**Video Source:** `{config.get('video', {}).get('source', 'ALPR.mp4')}`")
-            st.write(f"**Plate Detector:** Ensemble Fusion (`best.pt` + `best_finetuned.pt`)")
+            det_cfg = config.get("detection", {})
+            ensemble_cfg = det_cfg.get("plate_ensemble", {})
+            if ensemble_cfg.get("enabled"):
+                st.write("**Plate Detector:** Ensemble Fusion (`best.pt` + `best_finetuned.pt`)")
+            else:
+                plate_model_name = Path(det_cfg.get("plate_model_path", "best_finetuned.onnx")).name
+                st.write(f"**Plate Detector:** Single Model (`{plate_model_name}`)")
             st.write(f"**OCR Engine:** `{config.get('ocr', {}).get('backend', 'rapidocr').title()}`")
             st.caption("Frames are analyzed with ByteTrack tracking, plate cropping, SR upscaling, and OCR majority voting.")
 

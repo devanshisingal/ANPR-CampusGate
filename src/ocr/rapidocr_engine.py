@@ -67,28 +67,41 @@ class RapidOCREngine(OCREngine):
     PaddlePaddle framework.
 
     Args:
-        text_score:     Minimum confidence for a text region to be accepted.
-                        0.5 is a good balance; lower = more detections but
-                        noisier results.
-        use_det:        Run text detection inside the crop. For plate crops
-                        (already tightly cropped) this can be False to skip
-                        detection and go straight to recognition — faster,
-                        but detection=True is safer for slightly loose crops.
-        use_cls:        Run angle classifier to handle upside-down plates.
-        use_rec:        Run text recognition (always True).
+        text_score:           Minimum confidence for a text region to be accepted.
+        use_det:              Run text detection inside the crop. Keep True for
+                              2-line plates and blurry-crop filtering.
+        use_cls:              Run angle classifier to handle upside-down plates.
+        use_rec:              Run text recognition (always True).
+        det_limit_type:       DBNet resize mode ('max' prevents tiny crops from
+                              being upscaled to 736px short-side on CPU).
+        det_limit_side_len:   DBNet side-length limit paired with det_limit_type.
+        det_border_pad:       Replicated border padding (px) added before DBNet
+                              so characters at tight YOLO crop edges still trigger.
+        intra_op_num_threads: ONNX Runtime intra-op threads per session.
+        inter_op_num_threads: ONNX Runtime inter-op threads per session.
     """
 
     def __init__(
         self,
         text_score: float = 0.5,
         use_det: bool = True,
-        use_cls: bool = True,
+        use_cls: bool = False,
         use_rec: bool = True,
+        det_limit_type: str = "max",
+        det_limit_side_len: int = 320,
+        det_border_pad: int = 16,
+        intra_op_num_threads: int = 4,
+        inter_op_num_threads: int = 1,
     ) -> None:
         self.text_score = text_score
         self.use_det = use_det
         self.use_cls = use_cls
         self.use_rec = use_rec
+        self.det_limit_type = det_limit_type
+        self.det_limit_side_len = det_limit_side_len
+        self.det_border_pad = max(0, int(det_border_pad))
+        self.intra_op_num_threads = intra_op_num_threads
+        self.inter_op_num_threads = inter_op_num_threads
         self._engine = None
         self._init_failed = False
         self._initialize()
@@ -98,8 +111,24 @@ class RapidOCREngine(OCREngine):
         try:
             from rapidocr_onnxruntime import RapidOCR
 
-            _logger.info("Initializing RapidOCR engine...")
-            self._engine = RapidOCR()
+            _logger.info(
+                "Initializing RapidOCR engine (det_limit=%s:%d, cls=%s, threads=%d/%d)...",
+                self.det_limit_type,
+                self.det_limit_side_len,
+                self.use_cls,
+                self.intra_op_num_threads,
+                self.inter_op_num_threads,
+            )
+            self._engine = RapidOCR(
+                use_det=self.use_det,
+                use_cls=self.use_cls,
+                use_rec=self.use_rec,
+                text_score=self.text_score,
+                det_limit_type=self.det_limit_type,
+                det_limit_side_len=self.det_limit_side_len,
+                intra_op_num_threads=self.intra_op_num_threads,
+                inter_op_num_threads=self.inter_op_num_threads,
+            )
 
             # Log which ONNX Runtime execution providers are actually active.
             # This is critical on Jetson where GPU availability depends on
@@ -171,6 +200,20 @@ class RapidOCREngine(OCREngine):
             if img_bgr.dtype != np.uint8:
                 img_bgr = np.clip(img_bgr, 0, 255).astype(np.uint8)
 
+            # Tight YOLO plate crops leave almost no margin around border
+            # glyphs, causing DBNet to drop the text box entirely; replicate
+            # edge pixels slightly when detection is enabled.
+            border_pad = max(0, int(getattr(self, "det_border_pad", 16)))
+            if self.use_det and border_pad > 0:
+                img_bgr = cv2.copyMakeBorder(
+                    img_bgr,
+                    border_pad,
+                    border_pad,
+                    border_pad,
+                    border_pad,
+                    cv2.BORDER_REPLICATE,
+                )
+
             result = self._engine(
                 img_bgr,
                 use_det=self.use_det,
@@ -216,32 +259,44 @@ class RapidOCREngine(OCREngine):
                 # Support several observed RapidOCR return shapes:
                 # 1) (boxes, txts, scores)
                 # 2) (txts, scores)
-                # 3) (detections_list, time_float) where detections_list contains
-                #    items like [box, text, score]
+                # 3) (detections_list, time_float_or_elapse_list) where
+                #    detections_list contains [box, text, score] (use_det=True)
+                #    or [text, score] (use_det=False)
                 if len(result) >= 3:
                     txts = list(result[1] or [])
                     scores = list(result[2] or [])
                 elif len(result) == 2:
                     first, second = result[0], result[1]
-                    # Case: (txts, scores)
-                    if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
-                        txts = list(first or [])
-                        scores = list(second or [])
-                    # Case: (detections_list, time_float) where detections_list
-                    # contains entries like [box, text, score]
-                    elif isinstance(first, (list, tuple)) and (isinstance(second, float) or isinstance(second, int)):
-                        dets = list(first or [])
+                    if not isinstance(first, (list, tuple)):
+                        return ("", 0.0)
+                    has_nested_items = any(isinstance(item, (list, tuple)) for item in first)
+                    if has_nested_items:
                         txts = []
                         scores = []
-                        for item in dets:
-                            try:
-                                # item may be (box, text, score) or similar
-                                txt = item[1]
-                                score = item[2]
-                            except Exception:
+                        for item in first:
+                            if not isinstance(item, (list, tuple)):
                                 continue
-                            txts.append(txt)
-                            scores.append(score)
+                            if len(item) >= 3 and isinstance(item[-1], (int, float)):
+                                txts.append(item[1])
+                                scores.append(item[-1])
+                            elif len(item) == 2 and isinstance(item[1], (int, float)):
+                                txts.append(item[0])
+                                scores.append(item[1])
+                            elif len(item) >= 2:
+                                txt_part = next(
+                                    (p for p in item if isinstance(p, (str, bytes))),
+                                    None,
+                                )
+                                score_part = next(
+                                    (p for p in reversed(item) if isinstance(p, (int, float))),
+                                    0.0,
+                                )
+                                if txt_part is not None:
+                                    txts.append(txt_part)
+                                    scores.append(score_part)
+                    elif isinstance(second, (list, tuple)):
+                        txts = list(first)
+                        scores = list(second)
                     else:
                         return ("", 0.0)
                 else:

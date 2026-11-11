@@ -198,3 +198,23 @@ def classify_vehicle(plate: Optional[str]) -> dict:
         "color": "#f59e0b",
         "details": None,
     }
+
+
+def classify_status_batch(plates) -> dict[str, str]:
+    """Return {normalized_plate: status} for many plates with two cached lookups."""
+    from src.alerts.blacklist import get_blacklist
+
+    bl_plates = get_blacklist().plates()
+    wl_plates = get_whitelist().plates()
+    statuses: dict[str, str] = {}
+    for plate in plates:
+        norm = normalize_plate(plate)
+        if not norm or norm in statuses:
+            continue
+        if norm in bl_plates:
+            statuses[norm] = "Blacklisted"
+        elif norm in wl_plates:
+            statuses[norm] = "Authorized"
+        else:
+            statuses[norm] = "Unknown"
+    return statuses

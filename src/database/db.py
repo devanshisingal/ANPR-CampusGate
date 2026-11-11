@@ -479,7 +479,7 @@ def _coerce_filter_date(value) -> Optional[date]:
     return date.fromisoformat(str(value))
 
 
-def get_filtered_events(
+def _build_filtered_events_query(
     session: Session,
     *,
     start_date=None,
@@ -487,15 +487,15 @@ def get_filtered_events(
     directions=None,
     plate_search: Optional[str] = None,
     plate_number: Optional[str] = None,
-    limit: Optional[int] = 100,
-) -> list[dict]:
-    """Return newest-first event records matching local dates and filters."""
+    entities=None,
+):
+    """Build SQLAlchemy query + local-date bounds for filtered vehicle events."""
     first_day = _coerce_filter_date(start_date)
     last_day = _coerce_filter_date(end_date)
     if first_day and last_day and first_day > last_day:
         raise ValueError("start_date must be on or before end_date")
 
-    query = session.query(VehicleEvent)
+    query = session.query(*entities) if entities else session.query(VehicleEvent)
     if directions is not None:
         selected = (
             {directions.upper()}
@@ -503,7 +503,7 @@ def get_filtered_events(
             else {str(item).upper() for item in directions}
         )
         if not selected:
-            return []
+            return None, first_day, last_day
         if not selected.issubset({"IN", "OUT", "UNKNOWN"}):
             raise ValueError("directions must contain only IN, OUT, or UNKNOWN")
         query = query.filter(VehicleEvent.direction.in_(selected))
@@ -523,6 +523,30 @@ def get_filtered_events(
             last_day + timedelta(days=1), time.min, tzinfo=local_timezone
         ).astimezone(timezone.utc)
         query = query.filter(VehicleEvent.timestamp < local_end.isoformat())
+    return query, first_day, last_day
+
+
+def get_filtered_events(
+    session: Session,
+    *,
+    start_date=None,
+    end_date=None,
+    directions=None,
+    plate_search: Optional[str] = None,
+    plate_number: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> list[dict]:
+    """Return newest-first event records matching local dates and filters."""
+    query, first_day, last_day = _build_filtered_events_query(
+        session,
+        start_date=start_date,
+        end_date=end_date,
+        directions=directions,
+        plate_search=plate_search,
+        plate_number=plate_number,
+    )
+    if query is None:
+        return []
 
     query = query.order_by(VehicleEvent.timestamp.desc())
     if limit is not None:
@@ -556,21 +580,68 @@ def get_event_stats(
     last_day = _coerce_filter_date(end_date)
     if default_today and first_day is None and last_day is None:
         first_day = last_day = today
-    events = get_filtered_events(
+
+    query, first_day, last_day = _build_filtered_events_query(
         session,
         start_date=first_day,
         end_date=last_day,
         directions=directions,
-        limit=None,
+        entities=(
+            VehicleEvent.direction,
+            VehicleEvent.plate_number,
+            VehicleEvent.timestamp,
+        ),
     )
+    if query is None:
+        return {
+            "date": (last_day or today).isoformat(),
+            "start_date": first_day.isoformat() if first_day else None,
+            "end_date": last_day.isoformat() if last_day else None,
+            "entries": 0,
+            "exits": 0,
+            "unique_vehicles": 0,
+            "total_events": 0,
+        }
+
+    if first_day is None and last_day is None:
+        from sqlalchemy import case, func
+
+        entries, exits, unique_vehicles, total_events = query.with_entities(
+            func.coalesce(func.sum(case((VehicleEvent.direction == "IN", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((VehicleEvent.direction == "OUT", 1), else_=0)), 0),
+            func.count(func.distinct(VehicleEvent.plate_number)),
+            func.count(VehicleEvent.id),
+        ).one()
+    else:
+        entries = 0
+        exits = 0
+        total_events = 0
+        plates: set[str] = set()
+        for row_direction, row_plate, row_timestamp in query.all():
+            event_date = _event_local_date(row_timestamp)
+            if event_date is None:
+                continue
+            if first_day and event_date < first_day:
+                continue
+            if last_day and event_date > last_day:
+                continue
+            total_events += 1
+            if row_direction == "IN":
+                entries += 1
+            elif row_direction == "OUT":
+                exits += 1
+            if row_plate is not None:
+                plates.add(row_plate)
+        unique_vehicles = len(plates)
+
     return {
         "date": (last_day or today).isoformat(),
         "start_date": first_day.isoformat() if first_day else None,
         "end_date": last_day.isoformat() if last_day else None,
-        "entries": sum(1 for event in events if event["direction"] == "IN"),
-        "exits": sum(1 for event in events if event["direction"] == "OUT"),
-        "unique_vehicles": len({event["plate_number"] for event in events}),
-        "total_events": len(events),
+        "entries": int(entries),
+        "exits": int(exits),
+        "unique_vehicles": int(unique_vehicles),
+        "total_events": int(total_events),
     }
 
 
@@ -977,21 +1048,34 @@ def get_current_vehicle_locations(
     per-camera detection totals, which count it at every camera it passed.
     Scoped like the other trajectory queries (one session, or all sessions).
     """
-    rows = _scope_to_sessions(
-        session.query(VehicleEvent.plate_number, VehicleEvent.camera_id,
-                      VehicleEvent.timestamp, VehicleEvent.id),
+    from sqlalchemy import func
+
+    latest_subq = _scope_to_sessions(
+        session.query(
+            VehicleEvent.camera_id.label("camera_id"),
+            func.row_number()
+            .over(
+                partition_by=func.upper(func.coalesce(VehicleEvent.plate_number, "")),
+                order_by=(
+                    func.coalesce(VehicleEvent.timestamp, "").desc(),
+                    VehicleEvent.id.desc(),
+                ),
+            )
+            .label("rn"),
+        ),
         processing_session,
-    ).all()
-    latest: dict = {}
-    for plate, camera_id, timestamp, row_id in rows:
-        key = (plate or "").upper()
-        if key not in latest or (timestamp or "", row_id) > latest[key][0]:
-            latest[key] = ((timestamp or "", row_id), camera_id)
-    counts: dict = {}
-    for _, camera_id in latest.values():
-        if camera_id:
-            counts[camera_id] = counts.get(camera_id, 0) + 1
-    return counts
+    ).subquery()
+    rows = (
+        session.query(latest_subq.c.camera_id, func.count())
+        .filter(
+            latest_subq.c.rn == 1,
+            latest_subq.c.camera_id.isnot(None),
+            latest_subq.c.camera_id != "",
+        )
+        .group_by(latest_subq.c.camera_id)
+        .all()
+    )
+    return {camera_id: int(count) for camera_id, count in rows}
 
 
 def get_blacklisted_detections(session: Session, plates, limit: int = 200) -> list[dict]:

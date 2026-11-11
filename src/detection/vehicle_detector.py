@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 
+from src.detection._onnx_yolo import OnnxYoloRunner
 from src.utils.logger import get_logger
 
 _logger = get_logger("detection.vehicle_detector")
@@ -55,11 +56,21 @@ class VehicleDetector:
         # A pre-exported TensorRT/ONNX plan already fixes its precision and
         # device at export time; only a live .pt/torch model needs these
         # passed again at predict() time.
-        self._predict_kwargs = (
-            {"imgsz": self.imgsz}
-            if Path(model_path).suffix.lower() in {".engine", ".onnx"}
-            else {"imgsz": self.imgsz, "device": self.device, "half": self.half}
-        )
+        if Path(model_path).suffix.lower() in {".engine", ".onnx"}:
+            self._predict_kwargs = {
+                "imgsz": self.imgsz,
+                "conf": self.confidence_threshold,
+                "iou": 0.5,
+            }
+        else:
+            self._predict_kwargs = {
+                "imgsz": self.imgsz,
+                "device": self.device,
+                "conf": self.confidence_threshold,
+                "iou": 0.5,
+            }
+            if self.half:
+                self._predict_kwargs["half"] = True
 
     @classmethod
     def from_config(cls, config: dict) -> "VehicleDetector":
@@ -83,6 +94,20 @@ class VehicleDetector:
         if self._model is not None:
             return
         try:
+            if Path(self.model_path).suffix.lower() == ".onnx":
+                runner = OnnxYoloRunner(
+                    self.model_path,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                )
+                runner.warmup()
+                self._model = runner
+                _logger.info(
+                    "Vehicle detector loaded via ONNX Runtime from '%s' (imgsz=%d provider=%s)",
+                    self.model_path, self.imgsz, runner.active_provider,
+                )
+                return
+
             from ultralytics import YOLO
             self._model = YOLO(self.model_path)
             dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
@@ -110,6 +135,9 @@ class VehicleDetector:
         """
         model, self._model = self._model, None
         if model is None:
+            return
+        if isinstance(model, OnnxYoloRunner):
+            model.close()
             return
         try:
             # Ultralytics keeps the torch module (or the TensorRT wrapper) on
@@ -146,6 +174,31 @@ class VehicleDetector:
         """
         self._load_model()
 
+        if isinstance(self._model, OnnxYoloRunner):
+            try:
+                raw_boxes = self._model.predict(
+                    frame,
+                    conf_threshold=self.confidence_threshold,
+                    iou_threshold=0.5,
+                    allowed_classes=_VEHICLE_CLASSES,
+                )
+            except Exception as exc:
+                _logger.warning("Vehicle detection inference failed: %s", exc)
+                return []
+            return [
+                Detection(
+                    bbox=(
+                        int(box.bbox[0]),
+                        int(box.bbox[1]),
+                        int(box.bbox[2]),
+                        int(box.bbox[3]),
+                    ),
+                    class_label=box.class_label,
+                    confidence=box.confidence,
+                )
+                for box in raw_boxes
+            ]
+
         try:
             results = self._model(frame, verbose=False, **self._predict_kwargs)
         except Exception as exc:
@@ -155,22 +208,25 @@ class VehicleDetector:
         detections: list[Detection] = []
 
         for result in results:
-            if result.boxes is None:
+            if result.boxes is None or len(result.boxes) == 0:
                 continue
 
             boxes = result.boxes
-            for i in range(len(boxes)):
-                conf = float(boxes.conf[i])
+            confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.asarray(boxes.conf)
+            clss = boxes.cls.cpu().numpy() if hasattr(boxes.cls, "cpu") else np.asarray(boxes.cls)
+            xyxys = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.asarray(boxes.xyxy)
+            for i in range(len(confs)):
+                conf = float(confs[i])
                 if conf < self.confidence_threshold:
                     continue
 
-                cls_id = int(boxes.cls[i])
+                cls_id = int(clss[i])
                 class_name = result.names.get(cls_id, "").lower()
 
                 if class_name not in _VEHICLE_CLASSES:
                     continue
 
-                xyxy = boxes.xyxy[i].cpu().numpy()
+                xyxy = xyxys[i]
                 x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
 
                 detections.append(Detection(
@@ -179,7 +235,7 @@ class VehicleDetector:
                     confidence=conf,
                 ))
 
-        return self.non_max_suppression(detections, iou_threshold=0.5)
+        return detections
 
     @staticmethod
     def non_max_suppression(

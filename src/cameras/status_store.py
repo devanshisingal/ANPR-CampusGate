@@ -75,7 +75,6 @@ class StatusStore:
                     with os.fdopen(handle, "w", encoding="utf-8") as stream:
                         json.dump(payload, stream, default=str)
                         stream.flush()
-                        os.fsync(stream.fileno())
                     os.replace(temp_path, self.path)
                 except Exception:
                     # Never leave the temp file behind on a failed write --

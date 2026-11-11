@@ -13,6 +13,7 @@ from typing import Any, List, Tuple, Union
 
 import numpy as np
 
+from src.detection._onnx_yolo import OnnxYoloRunner
 from src.utils.logger import get_logger
 
 _logger = get_logger("detection.plate_detector")
@@ -151,11 +152,12 @@ class PlateDetector:
         self._predict_kwargs_list: list[dict] = []
 
         for mp in self.model_paths:
-            kwargs = (
-                {"imgsz": self.imgsz}
-                if Path(mp).suffix.lower() in {".engine", ".onnx"}
-                else {"imgsz": self.imgsz, "device": self.device, "half": self.half}
-            )
+            if Path(mp).suffix.lower() in {".engine", ".onnx"}:
+                kwargs = {"imgsz": self.imgsz, "conf": self.confidence_threshold}
+            else:
+                kwargs = {"imgsz": self.imgsz, "device": self.device, "conf": self.confidence_threshold}
+                if self.half:
+                    kwargs["half"] = True
             self._predict_kwargs_list.append(kwargs)
 
     @classmethod
@@ -202,12 +204,29 @@ class PlateDetector:
         if self._models:
             return
 
-        from ultralytics import YOLO
-
+        yolo_cls = None
         loaded_models = []
         for idx, (m_path, kwargs) in enumerate(zip(self.model_paths, self._predict_kwargs_list)):
             try:
-                m = YOLO(m_path)
+                if Path(m_path).suffix.lower() == ".onnx":
+                    runner = OnnxYoloRunner(
+                        m_path,
+                        imgsz=self.imgsz,
+                        device=self.device,
+                    )
+                    runner.warmup()
+                    loaded_models.append(runner)
+                    _logger.info(
+                        "Plate detector [%d/%d] loaded via ONNX Runtime from '%s' (imgsz=%d provider=%s)",
+                        idx + 1, len(self.model_paths), m_path, self.imgsz, runner.active_provider,
+                    )
+                    continue
+
+                if yolo_cls is None:
+                    from ultralytics import YOLO
+                    yolo_cls = YOLO
+
+                m = yolo_cls(m_path)
                 dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
                 m(dummy, verbose=False, **kwargs)
                 loaded_models.append(m)
@@ -237,7 +256,12 @@ class PlateDetector:
         """Release loaded models and free memory."""
         models = self._models
         self._models = []
+        used_torch = False
         for model in models:
+            if isinstance(model, OnnxYoloRunner):
+                model.close()
+                continue
+            used_torch = True
             try:
                 inner = getattr(model, "model", None)
                 if inner is not None and hasattr(inner, "cpu"):
@@ -245,6 +269,9 @@ class PlateDetector:
                 del inner, model
             except Exception as exc:
                 _logger.warning("Failed to release detector component: %s", exc)
+
+        if not used_torch:
+            return
 
         import gc
         gc.collect()
@@ -269,6 +296,24 @@ class PlateDetector:
         raw_detections: list[dict] = []
 
         for model_idx, (model, kwargs) in enumerate(zip(self._models, self._predict_kwargs_list)):
+            if isinstance(model, OnnxYoloRunner):
+                try:
+                    ort_boxes = model.predict(
+                        vehicle_crop,
+                        conf_threshold=self.confidence_threshold,
+                        iou_threshold=0.7,
+                    )
+                except Exception as exc:
+                    _logger.warning("Inference failed for model %d (%s): %s", model_idx, self.model_paths[model_idx], exc)
+                    continue
+                for box in ort_boxes:
+                    raw_detections.append({
+                        "box": list(box.bbox),
+                        "conf": box.confidence,
+                        "model_idx": model_idx,
+                    })
+                continue
+
             try:
                 results = model(vehicle_crop, verbose=False, **kwargs)
             except Exception as exc:
@@ -276,14 +321,16 @@ class PlateDetector:
                 continue
 
             for result in results:
-                if result.boxes is None:
+                if result.boxes is None or len(result.boxes) == 0:
                     continue
                 boxes = result.boxes
-                for i in range(len(boxes)):
-                    conf = float(boxes.conf[i])
+                confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.asarray(boxes.conf)
+                xyxys = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.asarray(boxes.xyxy)
+                for i in range(len(confs)):
+                    conf = float(confs[i])
                     if conf < self.confidence_threshold:
                         continue
-                    xyxy = boxes.xyxy[i].cpu().numpy()
+                    xyxy = xyxys[i]
                     x1 = max(0.0, float(xyxy[0]))
                     y1 = max(0.0, float(xyxy[1]))
                     x2 = min(float(w), float(xyxy[2]))
