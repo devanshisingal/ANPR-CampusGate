@@ -1,876 +1,671 @@
-#  ANPR - Campus Gate 
+# 🚗 ANPR - Campus Gate & Multi-Camera Trajectory System
 
-A production-quality **Automatic Number Plate Recognition (ANPR)** system built for university gate access monitoring. It detects vehicles in video streams, reads Indian license plates using a custom-trained YOLOv8m model + PaddleOCR, classifies vehicle types, and logs every entry/exit event to a SQLite database with a Next.js operations dashboard and REST API. The older Streamlit dashboards remain available as optional legacy tools.
+A production-quality **Automatic Number Plate Recognition (ANPR)**, access control, and **Multi-Camera Vehicle Trajectory Reconstruction** system engineered for campus security and gate monitoring.
+
+The system detects vehicles in live RTSP video feeds or recorded surveillance clips, localizes Indian license plates using a fine-tuned YOLOv8 model accelerated via **ONNX Runtime / TensorRT**, extracts registration numbers with a high-throughput **RapidOCR (PP-OCRv4 ONNX)** engine, classifies vehicle types and body colors, checks campus **Whitelist/Blacklist** status with instant alerts, and reconstructs multi-camera journeys on an interactive **Next.js operations dashboard** backed by a **FastAPI** REST API.
 
 ---
 
-##  Table of Contents
+## 📋 Table of Contents
 
 - [Features](#-features)
+- [System Architecture & Pipeline](#-system-architecture--pipeline)
 - [Multi-Camera Trajectory Reconstruction](#-multi-camera-trajectory-reconstruction)
-- [Pipeline Overview](#-pipeline-overview)
 - [Project Structure](#-project-structure)
 - [What Each File Does](#-what-each-file-does)
-- [Prerequisites](#-prerequisites) 
+- [Prerequisites](#-prerequisites)
 - [Installation](#-installation)
-- [Model Setup](#-model-setup)
-- [Configuration](#-configuration)
+- [Model Setup & Weights](#-model-setup--weights)
+- [Configuration Guide](#-configuration-guide)
 - [Usage — How to Run](#-usage--how-to-run)
-- [Training Your Own Model](#-training-your-own-model)
+- [Next.js Operations Dashboard](#-nextjs-operations-dashboard)
+- [Training & Model Evaluation](#-training--model-evaluation)
 - [API Reference](#-api-reference)
-- [Next.js Dashboard](#-nextjs-dashboard)
-- [Legacy Streamlit Dashboards](#-legacy-streamlit-dashboards)
 - [Running Tests](#-running-tests)
-- [Model Performance](#-model-performance)
+- [Model Performance & Benchmarks](#-model-performance--benchmarks)
 - [Tech Stack](#-tech-stack)
 - [Troubleshooting](#-troubleshooting)
+- [Documentation](#-documentation)
 
 ---
 
-##  Features
+## ⚡ Features
 
-- Real-time vehicle detection using YOLOv8n (COCO pretrained)
-- Custom-trained YOLOv8m plate detector — **99.47% mAP50** on Indian plates
-- ByteTrack vehicle tracking with consistent IDs across frames
-- PaddleOCR by default, with optional TrOCR / ensemble OCR for harder cases
-- Real-ESRGAN 4× super-resolution applied to every plate crop
-- Multi-frame OCR fusion (majority voting over 5 reads)
-- Indian plate validation — standard format + BH series
-- HSV-based plate color → vehicle type classification
-- Motion filter — only processes moving vehicles
-- Duplicate suppression — one entry per vehicle per 30-second window
-- Virtual line IN/OUT direction detection
-- SQLite database + FastAPI REST API + Next.js operations dashboard
-- CSV output mode for quick batch video processing
+### 🎯 High-Accuracy Detection & Tracking
+- **Vehicle Detection**: YOLOv8n (COCO pretrained) with direct ONNX Runtime / TensorRT acceleration.
+- **License Plate Detection**: Custom fine-tuned YOLOv8 (`best_finetuned.onnx` / `best.pt`) with **99.47% mAP50** on Indian plates (~6.3× faster than dual-model PyTorch ensembles).
+- **Dimension Filtering**: Automatic aspect and dimension gating (`min_plate_width_px: 36`, `min_plate_height_px: 12`) to eliminate false-positive OCR processing on tiny background artifacts.
+- **ByteTrack Tracking**: Consistent multi-vehicle tracking across frames with heavy-track throttling per frame (`live_max_heavy_tracks_per_frame: 1`, `max_heavy_tracks_per_frame: 2`) to sustain target frame rates under heavy traffic.
 
----
+### 🔍 Optimized OCR & Validation Pipeline
+- **RapidOCR Default Engine**: Powered by PP-OCRv4 ONNX via `onnxruntime` with DBNet crop size clamping (`det_limit_side_len: 320`) and angle-classifier bypass — achieves up to **~29× faster CPU OCR** without heavy PaddlePaddle dependencies.
+- **Flexible OCR Alternatives**: Switchable in `config.yaml` to **TensorRT PARSeq** (ultra-low latency on Jetson / GPU), PaddleOCR, TrOCR, EasyOCR, or multi-engine ensemble voting.
+- **Adaptive Lighting & Preprocessing**: Dynamic gamma correction for daytime glare and nighttime darkness, CLAHE contrast tuning, unsharp masking, and clean 64px height upscaling before OCR.
+- **Real-ESRGAN ×4 Super-Resolution**: Upscales small plate crops on demand when configured or running on high-power GPUs.
+- **Multi-Frame OCR Fusion with Early Exit**: Majority-voting fusion over rolling frame windows, with instant **early-exit flush** once 3 uncontested high-confidence reads (≥ 0.82) match.
+- **Indian Plate Validation**: Regex validation and positional alphanumeric repair (correcting `O`↔`0`, `I`↔`1`, `Z`↔`2`, `S`↔`5`) supporting standard state registrations and Bharat (BH) series plates.
 
-##  Multi-Camera Trajectory Reconstruction
+### 🛡️ Campus Security & Access Control
+- **Whitelist & Blacklist Access Control**: Live status evaluation (`Authorized`, `Blacklisted`, `Unknown`) with YAML/DB persistence and instant visual dashboard alerts for unauthorized or blacklisted vehicles.
+- **Plate Color & Vehicle Classification**: HSV color segmentation maps plate colors to legal vehicle categories (White → Private, Yellow → Commercial, Green → EV, Blue → Diplomatic, Black → Rental/Self-drive).
+- **Vehicle Body Color Profiling**: Extracts vehicle body paint colors for visual profile matching.
+- **Campus Direction Profiles**: Tailored directional tracking for gate cameras (e.g. `ch01` Main Gate 2, `ch02` Gate 2) using directional movement vectors, virtual crossing lines, and multi-frame trajectory confirmation.
 
-The system also runs as a **multi-camera vehicle trajectory reconstruction
-system**: several ALPR cameras across a city, each recognising plates
-independently, with a trajectory engine that joins those sightings into an
-ordered, mapped path for any given vehicle.
-
-```
-CAM001 Main Gate ───┐
-CAM002 Gate 2 ──────┤   recorded files sequentially ┌─▶ Trajectory engine
-CAM003 Karol Bagh ──┤   RTSP streams together      ─┤   (order · legs · GeoJSON)
-CAM004 Kashmere ────┘   into one shared database    └─▶ Leaflet map + timeline
-```
-
-Quick start (start the FastAPI API and Next.js frontend in separate terminals):
-
-```powershell
-# Terminal 1, repository root
-uvicorn src.api.server:app --host 0.0.0.0 --port 8000
-
-# Terminal 2
-Set-Location frontend
-npm i
-npm run dev
-```
-
-Open `http://localhost:3000`. To use a non-default API address, set
-`ANPR_API_URL` before starting Next.js. The FastAPI root redirects to the
-frontend URL; set `NEXTJS_URL` if the deployed frontend is not at
-`http://localhost:3000`.
-
-- Cameras are configured in **`config/camera_config.yaml`** (id, name,
-  latitude, longitude, video or RTSP source) — nothing is hardcoded.
-- CAM001 uses the **ch01** direction profile (lower-right IN, upper-left
-  OUT); CAM002 uses **ch02** (lower-left IN, upper-right OUT). Gate 2 has no
-  coordinates until it is surveyed.
-- Cameras are processed **strictly one at a time**: one GPU, and it keeps
-  demo timestamps monotonic across the queue.
-- Every camera takes **one** source: an uploaded video **or** an RTSP stream.
-  Both run through the same pipeline; switching is a one-field change with no
-  code changes. Recorded files run in order, while live RTSP feeds run
-  concurrently until processing is stopped.
-- The single-gate pipeline and API remain available; the primary operator
-  interface is now the Next.js dashboard described below.
-
-**Full documentation: [`docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md`](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md)**
-— architecture, data flow, database schema, trajectory engine, map engine,
-API reference, and the RTSP migration guide.
+### 🗺️ Multi-Camera Trajectories & Modern Operations UI
+- **Journey Reconstruction**: Aggregates timestamps and sightings across multiple campus gates into sequential vehicle trajectories with leg travel times and path history.
+- **Next.js 15+ Operations Dashboard**: Built with Next.js 15, React 19, Tailwind CSS, and Leaflet — featuring a live multi-camera wall, feed health monitors, vehicle trajectory route maps, event filters, plate crop galleries, access control manager, and CSV export.
+- **FastAPI REST API**: Comprehensive endpoints for event querying, vehicle profiles, camera MJPEG streaming, live snapshots, and whitelist/blacklist management.
 
 ---
 
-##  Pipeline Overview
+## 🏗️ System Architecture & Pipeline
 
 ```
-Video / RTSP Input
-        │
-        ▼
-Frame Capture          → src/capture/frame_capture.py
-        │
-        ▼
-Vehicle Detection      → src/detection/vehicle_detector.py     (YOLOv8n COCO)
-        │
-        ▼
-Vehicle Tracking       → src/tracking/vehicle_tracker.py       (ByteTrack)
-        │
-        ▼
-Motion Filter          → src/utils/motion_filter.py            (skip stationary vehicles)
-        │
-        ▼
-Plate Detection        → src/detection/plate_detector.py       (Custom YOLOv8m)
-        │
-        ▼
-Preprocessing          → src/preprocessing/plate_preprocessor.py  (CLAHE + denoise + sharpen)
-        │
-        ▼
-Super Resolution       → src/enhancement/super_resolution.py   (Real-ESRGAN ×4 — always applied)
-        │
-        ▼
-OCR                    → src/ocr/paddle_ocr_engine.py          (PaddleOCR)
-        │
-        ▼
-Post-processing        → src/ocr/ocr_postprocessor.py          (strip IND/INDIA, fix O↔0)
-        │
-        ▼
-Validation             → src/validation/plate_validator.py     (Indian plate regex)
-        │
-        ▼
-OCR Fusion             → src/validation/ocr_fusion.py          (majority voting, 5-frame window)
-        │
-        ▼
-Classification         → src/classification/                    (plate color → vehicle type)
-        │
-        ▼
-Duplicate Filter       → src/database/duplicate_filter.py      (30-second window)
-        │
-        ▼
-Direction Detection    → src/utils/direction_detector.py       (virtual line crossing IN/OUT)
-        │
-        ▼
-Database Storage       → src/database/db.py                    (SQLite via SQLAlchemy)
-        │
-        ▼
-API / Dashboard        → src/api/server.py + frontend/app/
+                       Video File / Live RTSP Stream / Multi-Camera Feeds
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │    src/capture/frame_capture.py  │
+                              │ (Threaded capture & reconnect)   │
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │ src/detection/vehicle_detector.py│ (YOLOv8n ONNX / TRT)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │  src/tracking/vehicle_tracker.py │ (ByteTrack)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │    src/utils/motion_filter.py    │ (Skip stationary vehicles)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │  src/detection/plate_detector.py │ (Fine-tuned YOLOv8 ONNX)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │src/preprocessing/plate_preproc.py│ (Adaptive lighting + CLAHE)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │src/enhancement/super_resolution.py (Real-ESRGAN / 64px scale)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │    src/ocr/rapidocr_engine.py    │ (RapidOCR PP-OCRv4 ONNX
+                              │  (or PARSeq TRT / PaddleOCR)     │  tuned for CPU / GPU)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │  src/ocr/ocr_postprocessor.py    │ (Positional fix: O↔0, I↔1)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │src/validation/plate_validator.py │ (Indian plate regex + BH)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │   src/validation/ocr_fusion.py   │ (Majority vote + Early exit)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │  src/alerts/whitelist.py         │ (Whitelist / Blacklist check)
+                              │  src/utils/direction_detector.py │ (Campus gate IN / OUT vector)
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │        src/database/db.py        │ (SQLite / PostgreSQL)
+                              └────────────────┬─────────────────┘
+                                               │
+                        ┌──────────────────────┴──────────────────────┐
+                        ▼                                             ▼
+       ┌─────────────────────────────────┐           ┌─────────────────────────────────┐
+       │       src/api/server.py         │           │        frontend/ (Next.js)      │
+       │ FastAPI Endpoints, Trajectories │◀─────────▶│ Camera Wall, Leaflet Route Map, │
+       │     & MJPEG Stream Servers      │           │    Access Lists & Analytics     │
+       └─────────────────────────────────┘           └─────────────────────────────────┘
 ```
 
 ---
 
-##  Project Structure
+## 🌐 Multi-Camera Trajectory Reconstruction
+
+When deployed across multiple checkpoints or campus gates, sightings from individual cameras are merged into chronological journey records:
 
 ```
-alpr-university-gate/
+CAM001 (Main Gate 2) ──┐
+CAM002 (Gate 2) ───────┼──▶ SQLite / PostgreSQL ──▶ Trajectory Engine ──▶ Leaflet Map & Timeline
+CAM003 (Academic) ─────┤    (camera attribution)     (trip legs & timing)   (interactive visualization)
+CAM004 (Hostel Gate) ──┘
+```
+
+- **Camera Registry (`config/camera_config.yaml`)**: Stores IDs, names, geographic coordinates (WGS84 lat/long), and feed sources.
+- **Directional Mapping**: Evaluates gate-specific vectors (`ch01` moves towards lower-right for IN; `ch02` moves towards lower-left for IN).
+- **Trajectory Engine (`src/trajectory/engine.py`)**: Groups detections by plate and reconstructs paths, measuring interval speeds and transit durations between gates.
+- For complete multi-camera specifications, see [`docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md`](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md).
+
+---
+
+## 📁 Project Structure
+
+```
+anpr_project/
+├── main.py                          # Pipeline entry point — runs full ANPR
+├── requirements.txt                 # Pinned dependencies (RapidOCR, ONNX Runtime, etc.)
+├── pytest.ini                       # Pytest test suite configuration
+├── conftest.py                      # Root pytest fixtures
 │
-├── main.py                          # Entry point — runs the full pipeline
-├── requirements.txt                 # All Python dependencies (pinned versions)
-├── pytest.ini                       # Pytest configuration
-├── conftest.py                      # Root-level test fixtures
-├── .gitignore
-├── frontend/                         # Next.js operations dashboard
-│   ├── app/                          # Dashboard UI, pages, and styles
-│   ├── next.config.ts                # FastAPI proxy rewrites
-│   └── package.json                  # Frontend dependencies and scripts
+├── frontend/                        # Next.js 15 Operations Dashboard
+│   ├── app/                         # App Router (Dashboard pages, live stream, styles)
+│   │   ├── page.tsx                 # Main monitoring UI & multi-camera wall
+│   │   ├── layout.tsx               # Root layout & theme wrapper
+│   │   └── globals.css              # Dashboard styling
+│   ├── next.config.ts               # Proxy rewrites routing to FastAPI backend
+│   ├── package.json                 # Next.js dependencies (React 19, Lucide, Tailwind)
+│   └── tsconfig.json                # TypeScript compiler configuration
 │
 ├── config/
-│   └── config.yaml                  # All configuration parameters (edit this)
+│   ├── config.yaml                  # Core pipeline configuration (models, OCR, fusion, gates)
+│   ├── camera_config.yaml           # Multi-camera registry and GPS siting
+│   └── whitelist.yaml               # Authorized & blacklisted plate registry
 │
-├── src/                             # All source modules
-│   ├── capture/
-│   │   └── frame_capture.py         # RTSP/video reader with auto-reconnect
-│   ├── detection/
-│   │   ├── vehicle_detector.py      # YOLOv8n — detects cars, trucks, buses, motorcycles
-│   │   └── plate_detector.py        # Custom YOLOv8m — detects license plate regions
-│   ├── tracking/
-│   │   └── vehicle_tracker.py       # ByteTrack — assigns consistent IDs to vehicles
-│   ├── preprocessing/
-│   │   └── plate_preprocessor.py    # Grayscale → CLAHE → Denoise → Sharpen
-│   ├── enhancement/
-│   │   └── super_resolution.py      # Real-ESRGAN ×4 upscaling (applied to all crops)
-│   ├── ocr/
-│   │   ├── base.py                  # Abstract OCREngine interface
-│   │   ├── paddle_ocr_engine.py     # PaddleOCR backend (default)
-│   │   ├── trocr_engine.py          # TrOCR backend (optional alternative)
-│   │   ├── ocr_postprocessor.py     # Strip IND/INDIA, fix O↔0, remove noise chars
-│   │   └── __init__.py              # create_ocr_engine() factory function
-│   ├── validation/
-│   │   ├── plate_validator.py       # Indian plate regex + OCR correction (O↔0, I↔1)
-│   │   └── ocr_fusion.py            # Multi-frame majority voting for final plate number
-│   ├── classification/
-│   │   ├── color_classifier.py      # HSV-based plate color detection
-│   │   └── vehicle_classifier.py    # Maps plate color → vehicle type (Private/Commercial/etc.)
-│   ├── database/
-│   │   ├── models.py                # SQLAlchemy ORM — VehicleEvent table schema
-│   │   ├── db.py                    # Session management, CRUD, image saving
-│   │   └── duplicate_filter.py      # Prevents duplicate entries within 30-second window
-│   ├── utils/
-│   │   ├── config.py                # YAML config loader with validation
-│   │   ├── logger.py                # Rotating file + console logger
-│   │   ├── direction_detector.py    # Virtual line crossing → IN or OUT
-│   │   └── motion_filter.py         # Filters out stationary vehicles
+├── src/
+│   ├── alerts/
+│   │   ├── whitelist.py             # Whitelist & blacklist manager with disk persistence
+│   │   └── blacklist.py             # Blacklist alert query helpers
 │   ├── api/
-│   │   ├── server.py                # FastAPI app — GET /logs, GET /search, POST /entry
-│   │   └── schemas.py               # Pydantic request/response models
-│   └── dashboard/
-│       └── app.py                   # Streamlit live monitor (auto-refreshes every 3s)
+│   │   ├── server.py                # FastAPI REST API (logs, search, stats, entry)
+│   │   ├── trajectory_routes.py     # Trajectory, camera feed, and MJPEG stream endpoints
+│   │   └── schemas.py               # Pydantic request and response schemas
+│   ├── cameras/
+│   │   ├── manager.py               # Multi-camera queue & concurrent ingestion coordinator
+│   │   ├── registry.py              # Camera metadata loader from YAML
+│   │   ├── sources.py               # Video file and RTSP source abstractions
+│   │   ├── status_store.py          # Real-time pipeline processing state persistence
+│   │   └── preview_server.py        # MJPEG live preview HTTP server
+│   ├── capture/
+│   │   └── frame_capture.py         # Threaded RTSP & video reader with auto-reconnection
+│   ├── classification/
+│   │   ├── color_classifier.py      # HSV plate color classification
+│   │   ├── vehicle_classifier.py    # Plate color to vehicle type mapping
+│   │   └── vehicle_color.py         # Vehicle body paint color extractor
+│   ├── dashboard/
+│   │   ├── app.py                   # Legacy Streamlit single-gate dashboard
+│   │   └── trajectory_app.py        # Legacy Streamlit trajectory visualizer
+│   ├── dashboard_web/               # Standalone vanilla HTML/JS web dashboard
+│   ├── database/
+│   │   ├── db.py                    # SQLAlchemy session management, CRUD, crop saving
+│   │   ├── models.py                # Database models (VehicleEvent, Camera, etc.)
+│   │   ├── duplicate_filter.py      # Duplicate event suppressor (Levenshtein edit distance)
+│   │   ├── vehicle_profiles.py      # Aggregated vehicle sighting profiles
+│   │   └── postgres_schema.py       # PostgreSQL schema compatibility
+│   ├── detection/
+│   │   ├── _onnx_yolo.py            # High-speed ONNX Runtime YOLO runner with OpenCV fallback
+│   │   ├── plate_detector.py        # Fine-tuned YOLOv8 plate detector (ONNX / PyTorch)
+│   │   └── vehicle_detector.py      # YOLOv8n vehicle detector (ONNX / PyTorch)
+│   ├── enhancement/
+│   │   └── super_resolution.py      # Real-ESRGAN ×4 super-resolution model
+│   ├── mapping/
+│   │   ├── leaflet.py               # Leaflet map HTML & GeoJSON builder
+│   │   └── heatmap.py               # Campus density heatmap generation
+│   ├── ocr/
+│   │   ├── base.py                  # Abstract base class for OCR engines
+│   │   ├── rapidocr_engine.py       # RapidOCR PP-OCRv4 ONNX engine (default, CPU-tuned)
+│   │   ├── parseq_tensorrt_engine.py# NVIDIA TensorRT PARSeq OCR engine
+│   │   ├── paddle_ocr_engine.py     # PaddleOCR backend
+│   │   ├── trocr_engine.py          # Microsoft TrOCR transformer backend
+│   │   ├── easyocr_engine.py        # EasyOCR backend
+│   │   ├── ensemble_engine.py       # Multi-engine voting ensemble
+│   │   └── ocr_postprocessor.py     # Strips IND/INDIA, fixes O↔0, normalizes plates
+│   ├── preprocessing/
+│   │   └── plate_preprocessor.py    # Adaptive lighting, CLAHE, and sharpening
+│   ├── tracking/
+│   │   └── vehicle_tracker.py       # ByteTrack multi-object vehicle tracker
+│   ├── trajectory/
+│   │   ├── engine.py                # Multi-camera trajectory builder & leg computation
+│   │   └── geojson.py               # Path GeoJSON serializer
+│   ├── utils/
+│   │   ├── config.py                # YAML configuration loader & validator
+│   │   ├── direction_detector.py    # Campus-specific virtual line & directional vectors
+│   │   ├── motion_filter.py         # Filters out stationary/parked vehicles
+│   │   ├── live_frame.py            # Annotated live frame writer for streams
+│   │   └── logger.py                # Rotating file and console logger
+│   └── validation/
+│       ├── plate_validator.py       # Indian license plate regex & positional corrector
+│       └── ocr_fusion.py            # Multi-frame majority voting with early-exit flush
 │
 ├── scripts/
-│   ├── run_pipeline.py              # Full pipeline with DB storage + tracking + SR
-│   ├── run_alpr.py                  # Lightweight CSV output (no tracking, no DB)
-│   ├── video_output.py              # Annotated video with bounding boxes
-│   └── test_model.py                # Batch test on image folder → JSON + annotated images
-│
-├── training/
-│   ├── dataset_converter.py         # Converts JSON labels → YOLO format + train/test split
-│   ├── augmentation.py              # Brightness, blur, noise, fog, rotation augmentations
-│   ├── trainer.py                   # YOLOv8m training script (100 epochs, RTX 3050)
-│   └── evaluator.py                 # Computes mAP, precision, recall, FLOPs
+│   ├── run_pipeline.py              # Full pipeline with camera management & live streaming
+│   ├── run_alpr.py                  # Lightweight standalone CSV mode (no DB)
+│   ├── video_output.py              # Annotated video generator with bounding boxes
+│   ├── test_model.py                # Batch model validation on image directories
+│   ├── compare_models.py            # Benchmark comparison between baseline & fine-tuned models
+│   └── benchmark_ocr_backends.py    # Benchmarks RapidOCR, PARSeq, PaddleOCR, and TrOCR
 │
 ├── tests/
-│   ├── conftest.py                  # Shared fixtures (Hypothesis, DB session, image generators)
-│   ├── unit/                        # Unit tests for each src/ module
-│   │   ├── test_plate_validator.py
-│   │   ├── test_ocr_fusion.py
-│   │   ├── test_plate_preprocessor.py
-│   │   ├── test_color_classifier.py
-│   │   ├── test_vehicle_classifier.py
-│   │   ├── test_duplicate_filter.py
-│   │   ├── test_direction_detector.py
-│   │   ├── test_super_resolution.py
-│   │   ├── test_config.py
-│   │   └── test_logger.py
-│   └── integration/                 # Integration tests
-│       ├── test_api.py
-│       ├── test_database.py
-│       └── test_dataset_converter.py
+│   ├── unit/                        # Unit tests for OCR, ONNX, tracking, and direction
+│   └── integration/                 # Integration tests for API, pipeline, and database
 │
-├── docs/
-│   └── pipeline.md                  # Detailed pipeline documentation
-│
-└── models/                          # Model weights — NOT in git, download separately
-    ├── plate_detector/
-    │   ├── best.pt                  # ← Custom trained plate detector (REQUIRED)
-    │   └── train/                   # Training graphs, confusion matrix, results.csv
-    ├── vehicle_detector/
-    │   └── yolov8n.pt               # ← Auto-downloaded by ultralytics on first run
-    └── realesrgan/
-        └── RealESRGAN_x4plus.pth    # ← SR weights (REQUIRED, download below)
+└── docs/                            # In-depth architectural & deployment documentation
 ```
 
 ---
 
-##  What Each File Does
+## 🔍 What Each File Does
 
-### Entry Points
-
-| File | What it does |
+| Component / File | Purpose & Responsibilities |
 |---|---|
-| `main.py` | Thin wrapper — calls `scripts/run_pipeline.py`. Run this for the full system. |
-| `scripts/run_pipeline.py` | Full pipeline: vehicle detection → tracking → plate detection → OCR → DB storage |
-| `scripts/run_alpr.py` | Lightweight mode: detects plates frame-by-frame, saves unique plates to CSV. No tracking, no DB. |
-| `scripts/video_output.py` | Reads a video, draws green boxes (vehicles) + orange boxes (plates) + plate text, saves annotated MP4. |
-| `scripts/test_model.py` | Batch tests the plate detector on a folder of images. Saves a JSON + annotated image per input. |
-
-### Source Modules (`src/`)
-
-| Module | What it does |
-|---|---|
-| `capture/frame_capture.py` | Opens video files or RTSP streams. Handles reconnection on failure. Respects `frame_skip` config. |
-| `detection/vehicle_detector.py` | Runs YOLOv8n on each frame. Returns bounding boxes for cars, trucks, buses, motorcycles. |
-| `detection/plate_detector.py` | Runs custom YOLOv8m on a vehicle crop. Returns the plate region bounding box. |
-| `tracking/vehicle_tracker.py` | ByteTrack wrapper. Assigns a stable integer ID to each vehicle across frames. |
-| `preprocessing/plate_preprocessor.py` | Converts plate crop to grayscale, applies CLAHE contrast enhancement, denoises, sharpens. |
-| `enhancement/super_resolution.py` | Runs Real-ESRGAN ×4 on every plate crop before OCR. Improves readability of small/blurry plates. |
-| `ocr/paddle_ocr_engine.py` | Sends plate image to PaddleOCR. Returns (text, confidence). |
-| `ocr/trocr_engine.py` | Alternative OCR using Microsoft TrOCR (transformer-based). Swap in `config.yaml`. |
-| `ocr/ocr_postprocessor.py` | Strips `IND`/`INDIA` text (Ashoka Chakra area), removes noise characters, fixes common OCR errors. |
-| `validation/plate_validator.py` | Validates OCR output against Indian plate regex. Corrects O↔0, I↔1 at known positions. Supports standard + BH series. |
-| `validation/ocr_fusion.py` | Collects OCR reads for each tracked vehicle over 5 frames. Returns the majority-voted plate number. |
-| `classification/color_classifier.py` | Detects plate background color (White/Yellow/Green/Blue/Black) using HSV ranges. |
-| `classification/vehicle_classifier.py` | Maps plate color to vehicle type: White→Private, Yellow→Commercial, Green→EV, etc. |
-| `database/models.py` | SQLAlchemy ORM model for the `vehicle_events` table. |
-| `database/db.py` | Creates DB, manages sessions, inserts events, saves plate crop images to disk. |
-| `database/duplicate_filter.py` | Tracks recently seen (plate, track_id) pairs. Blocks re-entry within 30 seconds. |
-| `utils/config.py` | Loads and validates `config/config.yaml`. |
-| `utils/logger.py` | Sets up rotating file logger + colored console output. |
-| `utils/direction_detector.py` | Tracks vehicle centroid movement relative to a virtual line. Returns `IN` or `OUT`. |
-| `utils/motion_filter.py` | Compares centroid positions across frames. Skips vehicles that haven't moved enough. |
-| `api/server.py` | FastAPI app. Exposes `GET /logs`, `GET /search?plate=XX`, `POST /entry`. |
-| `api/schemas.py` | Pydantic models for API request/response validation. |
-| `dashboard/app.py` | Streamlit app. Shows live event table, plate crop images, stats. Auto-refreshes every 3 seconds. |
-
-### Training (`training/`)
-
-| File | What it does |
-|---|---|
-| `dataset_converter.py` | Reads JSON label files from `dataset/train/labels/`, converts to YOLO `.txt` format, splits into train/test. |
-| `augmentation.py` | Applies random brightness, blur, noise, fog, and rotation to training images. |
-| `trainer.py` | Trains YOLOv8m for 100 epochs on the converted dataset. Saves `best.pt` to `models/plate_detector/`. |
-| `evaluator.py` | Runs the trained model on the test set. Computes mAP50, mAP50-95, precision, recall, FLOPs. |
+| `main.py` | Top-level execution wrapper invoking `scripts/run_pipeline.py`. |
+| `src/detection/_onnx_yolo.py` | Direct ONNX Runtime wrapper providing fast YOLOv8 execution without PyTorch overhead. |
+| `src/detection/plate_detector.py` | Detects plate regions using `best_finetuned.onnx` with size-filtering safeguards. |
+| `src/detection/vehicle_detector.py` | Detects cars, buses, trucks, and motorcycles using `yolov8n.onnx`. |
+| `src/ocr/rapidocr_engine.py` | High-speed PP-OCRv4 ONNX engine with DBNet limits tuned for minimal CPU latency. |
+| `src/ocr/parseq_tensorrt_engine.py` | TensorRT 10/8 engine for PARSeq OCR on NVIDIA GPU / Jetson platforms. |
+| `src/validation/ocr_fusion.py` | Accumulates OCR reads across frames with early exit on 3 matching high-confidence votes. |
+| `src/validation/plate_validator.py` | Positional corrector and regex validator for standard Indian and Bharat (BH) plates. |
+| `src/alerts/whitelist.py` | Loads, stores, and validates plates against Authorized and Blacklisted access lists. |
+| `src/utils/direction_detector.py` | Campus directional vectors (`ch01` Main Gate 2, `ch02` Gate 2) for accurate IN/OUT detection. |
+| `src/trajectory/engine.py` | Correlates sightings across campus cameras into chronologically ordered vehicle routes. |
+| `src/mapping/leaflet.py` | Produces interactive Leaflet maps with route poly-lines, markers, and transit times. |
+| `src/api/server.py` | Core FastAPI application serving query endpoints, statistics, and access control APIs. |
+| `src/api/trajectory_routes.py` | Trajectory reconstruction, camera feed health, and MJPEG streaming routes. |
+| `frontend/app/page.tsx` | Comprehensive Next.js operations dashboard for live camera walls, access logs, and alerts. |
 
 ---
 
-##  Prerequisites
+## 📦 Prerequisites
 
-- Python **3.10** (required — PaddlePaddle 3.0.0 is not compatible with 3.11+)
-- NVIDIA GPU with CUDA 11.8 (recommended for Real-ESRGAN + training; CPU works but is slow)
-- ~8 GB disk space for models and dependencies
+- **Python**: `3.10`, `3.11`, or `3.12`
+- **Node.js**: `v18.x` or higher (for the Next.js operations dashboard)
+- **Hardware**:
+  - **CPU**: Standard multi-core x86 or ARM CPU (RapidOCR + ONNX Runtime runs efficiently on CPU).
+  - **GPU (Optional)**: NVIDIA GPU with CUDA 11.8 / 12.x or Jetson Orin Nano for TensorRT / Real-ESRGAN acceleration.
 
 ---
 
-##  Installation
+## 🚀 Installation
 
-### 1. Clone the repository
-
+### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/alpr-university-gate.git
-cd alpr-university-gate
+git clone https://github.com/devanshisingal/ANPR-CampusGate.git
+cd ANPR-CampusGate
 ```
 
-### 2. Create a virtual environment
-
+### 2. Set Up Python Environment
 ```bash
 python -m venv venv
 
-# Windows
-venv\Scripts\activate
+# Windows (PowerShell)
+.\venv\Scripts\Activate.ps1
 
-# Linux / Mac
+# Linux / macOS
 source venv/bin/activate
 ```
 
-### 3. Install PyTorch (GPU)
-
+### 3. Install Python Dependencies
 ```bash
-pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu118
-```
-
-> For CPU-only: `pip install torch==2.2.2 torchvision==0.17.2`
-
-### 4. Install PaddlePaddle
-
-```bash
-# GPU (CUDA 11.8)
-pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
-
-# CPU only
-pip install paddlepaddle==3.0.0
-```
-
-### 5. Install all other dependencies
-
-```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
----
+> **GPU Acceleration Note**:
+> By default, `requirements.txt` installs CPU `onnxruntime`. To enable NVIDIA GPU acceleration on desktop or server:
+> ```bash
+> pip install onnxruntime-gpu==1.18.0
+> ```
+> For NVIDIA Jetson Orin (JetPack 6.x), refer to the onnxruntime index detailed inside `requirements.txt`.
 
-##  Model Setup
-
-Three model files are needed. None are included in the repository (they are in `.gitignore`).
-
-### 1. Plate Detector — `models/plate_detector/best.pt` *(REQUIRED)*
-
-This is the custom-trained YOLOv8m model. Download it from the project's release page or Google Drive link (provided separately) and place it at:
-
-```
-models/plate_detector/best.pt
-```
-
-### 2. Vehicle Detector — `models/vehicle_detector/yolov8n.pt` *(auto-downloaded)*
-
-This is the standard YOLOv8n COCO model. It is **automatically downloaded** by the `ultralytics` library on first run. No manual action needed.
-
-If you want to pre-download it:
-
+### 4. Install Next.js Frontend Dependencies
 ```bash
-python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-# Then move it:
-# Windows: move yolov8n.pt models\vehicle_detector\
-# Linux:   mv yolov8n.pt models/vehicle_detector/
-```
-
-### 3. Real-ESRGAN Weights — `models/realesrgan/RealESRGAN_x4plus.pth` *(REQUIRED)*
-
-```bash
-python -c "
-import urllib.request, os
-os.makedirs('models/realesrgan', exist_ok=True)
-urllib.request.urlretrieve(
-    'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',
-    'models/realesrgan/RealESRGAN_x4plus.pth'
-)
-print('Downloaded RealESRGAN_x4plus.pth')
-"
+cd frontend
+npm install
+cd ..
 ```
 
 ---
 
-##  Configuration
+## 🧠 Model Setup & Weights
 
-All settings live in `config/config.yaml`. You should not need to change anything except the video source.
+The repository utilizes optimized ONNX and PyTorch weights stored in `models/`:
 
-### Key settings to know
+```
+models/
+├── plate_detector/
+│   ├── best_finetuned.onnx          # ← Fine-tuned plate detector (ONNX, recommended)
+│   ├── best_finetuned.pt            # ← Fine-tuned plate detector (PyTorch)
+│   └── best.pt                      # ← Baseline YOLOv8m plate detector
+├── vehicle_detector/
+│   ├── yolov8n.onnx                 # ← ONNX vehicle detector (COCO pretrained)
+│   └── yolov8n.pt                   # ← Auto-downloaded by ultralytics if missing
+└── realesrgan/
+    └── RealESRGAN_x4plus.pth        # ← Super-resolution weights (optional)
+```
+
+### Downloading Real-ESRGAN Weights (Optional)
+If you wish to use Real-ESRGAN super-resolution for very small or distant plates:
+```bash
+python -c "import urllib.request, os; os.makedirs('models/realesrgan', exist_ok=True); urllib.request.urlretrieve('https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth', 'models/realesrgan/RealESRGAN_x4plus.pth'); print('Downloaded RealESRGAN weights.')"
+```
+
+---
+
+## ⚙️ Configuration Guide
+
+All core operational settings reside in `config/config.yaml`:
 
 ```yaml
 video:
-  source: "ALPR.mp4"        # ← Change this to your video file or RTSP URL
-  frame_skip: 2             # Process every 2nd frame (set to 1 for every frame)
+  source: "mycarplate.mp4"              # Video file, RTSP URL, or 0 for webcam
+  frame_skip: 1                         # Process every frame (preserves tracking continuity)
+  max_retries: 5                        # Reconnect attempts on stream disconnect
 
 detection:
-  vehicle_model_path: "models/vehicle_detector/yolov8n.pt"
+  device: "cpu"                         # "cpu" or GPU index (0)
+  vehicle_model_path: "models/vehicle_detector/yolov8n.onnx"
   vehicle_confidence: 0.5
-  plate_model_path: "models/plate_detector/best.pt"
-  plate_confidence: 0.4
+  plate_model_path: "models/plate_detector/best_finetuned.onnx"
+  plate_confidence: 0.28
+  plate_imgsz: 320
+  min_plate_width_px: 36                # Skip specks smaller than 36x12 px
+  min_plate_height_px: 12
+
+tracking:
+  lost_track_timeout: 60                # Frame timeout for lost tracks
+  live_max_heavy_tracks_per_frame: 1    # Cap plate-detection calls per frame
+
+preprocessing:
+  adaptive_lighting: true               # Auto gamma correction for day/night glare
+  target_height_px: 64                  # Upscale crop cleanly prior to CLAHE
+  clahe_clip_limit: 2.0
 
 enhancement:
-        sr_threshold_px: 180      # Real-ESRGAN only for small plates in live mode
-  realesrgan_model_path: "models/realesrgan/RealESRGAN_x4plus.pth"
+  sr_threshold_px: 0                    # 0 to bypass SR on CPU; 80-120 on GPU with Real-ESRGAN
 
 ocr:
-        backend: "paddleocr"      # Fast default for live processing
-        ensemble:
-                backends: ["paddleocr", "trocr"]
-                min_vote_count: 1
-                use_variants: true
+  backend: "rapidocr"                   # "rapidocr" (default), "parseq_tensorrt", "paddleocr"
+  rapidocr:
+    det_limit_type: "max"
+    det_limit_side_len: 320             # Clamps DBNet side length (~29x CPU speedup)
+    use_cls: false                      # Skip angle classifier on upright gate cameras
+    det_border_pad: 16
 
 fusion:
-  window_size: 5            # Majority vote over 5 OCR reads per vehicle
-  min_confidence: 0.55
+  window_size: 5                        # Majority-vote window
+  min_confidence: 0.60
+  early_exit_votes: 3                   # Early flush when 3 uncontested reads agree
+  early_exit_min_confidence: 0.82
 
-deduplication:
-  window_seconds: 30        # Ignore same plate within 30 seconds
+direction:
+  active_camera: "ch01"                 # Select campus profile: "ch01", "ch02", or "default"
 
 database:
   path: "data/alpr.db"
   image_save_path: "data/plate_crops/"
+  vehicle_image_save_path: "data/vehicle_crops/"
 ```
-
-### Full config reference
-
-| Section | Key | Description |
-|---|---|---|
-| `video` | `source` | Video file path or RTSP URL |
-| `video` | `frame_skip` | Process every Nth frame |
-| `detection` | `vehicle_confidence` | Min confidence for vehicle detection (0–1) |
-| `detection` | `plate_confidence` | Min confidence for plate detection (0–1) |
-| `tracking` | `lost_track_timeout` | Frames before a lost track is retired |
-| `preprocessing` | `clahe_clip_limit` | CLAHE contrast limit (higher = more contrast) |
-| `enhancement` | `sr_threshold_px` | Apply SR if plate width < this value |
-| `ocr` | `backend` | `paddleocr`, `trocr`, or `ensemble` |
-| `ocr` | `ensemble` | Ensemble OCR voting settings |
-| `fusion` | `window_size` | Number of OCR reads to majority-vote over |
-| `fusion` | `min_confidence` | Minimum OCR confidence to accept a read |
-| `deduplication` | `window_seconds` | Duplicate suppression window |
-| `direction` | `virtual_line` | Coordinates of the virtual IN/OUT line |
-| `database` | `path` | SQLite database file path |
-| `api` | `port` | FastAPI server port (default: 8000) |
 
 ---
 
-##  Usage — How to Run
+## 💻 Usage — How to Run
 
-### Option 1: Full pipeline (recommended)
+### Option 1: Full System (API + Next.js Dashboard)
 
-Runs the complete system: vehicle detection → tracking → plate OCR → database storage.
+Start the system in two terminals:
+
+#### Terminal 1 — Start the FastAPI Backend
+```bash
+uvicorn src.api.server:app --host 0.0.0.0 --port 8000
+```
+- API Documentation (Swagger UI): `http://localhost:8000/docs`
+
+#### Terminal 2 — Start the Next.js Operations Dashboard
+```bash
+cd frontend
+npm run dev
+```
+- Open `http://localhost:3000` in your browser.
+
+---
+
+### Option 2: Run the Video Pipeline
+
+Run the end-to-end ANPR pipeline directly on a recorded video or RTSP feed:
 
 ```bash
-# Use the source defined in config.yaml
+# Process video configured in config.yaml
 python main.py
 
-# Override with a specific video file
-python main.py --source ALPR.mp4
-
-# Use an RTSP stream
-python main.py --source rtsp://192.168.1.100/stream
+# Specify an alternate video or RTSP stream
+python main.py --source "path/to/gate_feed.mp4"
+python main.py --source "rtsp://admin:pass@192.168.1.50:554/stream1"
 ```
 
-Results are stored in `data/alpr.db`. Plate crop images are saved to `data/plate_crops/`.
+Events are saved to `data/alpr.db`, with plate crops saved in `data/plate_crops/` and live annotated preview frames in `data/live_frame.jpg`.
 
 ---
 
-### Option 2: Simple CSV output (no database, no tracking)
+### Option 3: Multi-Camera Processing Queue
 
-Faster and simpler. Detects plates frame-by-frame and writes unique plates to a CSV file.
+Process all registered campus cameras (from `config/camera_config.yaml`):
 
 ```bash
-python scripts/run_alpr.py --source ALPR.mp4
-
-# Custom output path
-python scripts/run_alpr.py --source ALPR.mp4 --output output/results.csv
-
-# Require at least 3 consistent reads before saving a plate
-python scripts/run_alpr.py --source ALPR.mp4 --min-reads 3
+python scripts/run_pipeline.py
 ```
 
-Output: `output/results.csv` with columns: `plate_number, vehicle_type, plate_color, series_type, confidence, total_reads, best_frame, timestamp`
+Runs sequential processing for recorded files and initiates live feeds concurrently, streaming status to the Next.js multi-camera wall.
 
 ---
 
-### Option 3: Annotated video with bounding boxes
+### Option 4: Quick Batch CSV Mode (No Database)
 
-Draws green boxes around vehicles, orange boxes around plates, overlays plate numbers, and saves an annotated MP4.
+Extract unique license plates from a video directly into a CSV file without database setup:
 
 ```bash
-python scripts/video_output.py --source ALPR.mp4
+python scripts/run_alpr.py --source ALPR.mp4 --output output/results.csv --min-reads 3
+```
 
-# Custom output path
+---
+
+### Option 5: Export Annotated Video
+
+Generate an MP4 video overlaid with green vehicle bounding boxes, orange license plate boxes, and identified plate numbers:
+
+```bash
 python scripts/video_output.py --source ALPR.mp4 --output output/annotated.mp4
 ```
 
-Output: `output/ALPR_annotated.mp4`
-
 ---
 
-### Option 4: Batch test on image folder
+### Option 6: Legacy Streamlit Dashboards
 
-Tests the plate detector on a folder of images. Saves a JSON file and annotated image for each input.
-
-```bash
-python scripts/test_model.py
-
-# Custom input/output folders
-python scripts/test_model.py --images path/to/images --output output/results
-```
-
-Output per image:
-- `output/test_2_output/image_name.jpg` — annotated image with bounding box and plate number
-- `output/test_2_output/image_name.json` — detection result:
-
-```json
-{
-  "image": "1003.jpg",
-  "image_width": 640,
-  "image_height": 480,
-  "plates_detected": 1,
-  "detections": [
-    {
-      "bbox": {
-        "xmin": 210, "ymin": 310, "xmax": 430, "ymax": 370,
-        "x_center": 0.5, "y_center": 0.708,
-        "width_norm": 0.344, "height_norm": 0.125
-      },
-      "plate_number": "KA19TR0234",
-      "ocr_confidence": 0.923,
-      "detection_confidence": 0.871
-    }
-  ]
-}
-```
-
-Also saves `output/test_2_output/summary.json` with overall stats.
-
----
-
-### Option 5: Start the REST API
+For lightweight local inspection, the legacy Streamlit applications remain available:
 
 ```bash
-uvicorn src.api.server:app --host 0.0.0.0 --port 8000
-```
-
-Then open `http://localhost:8000/docs` for the interactive Swagger UI.
-
----
-
-### Option 6: Start the Next.js operations dashboard
-
-The dashboard includes the live multi-camera wall, feed-health indicators,
-date/direction-filtered events and statistics, recognition snapshots, access
-list management and blacklist alerts, source uploads/RTSP configuration,
-processing controls, and vehicle history with a route map.
-
-Start the API and frontend in separate terminals:
-
-```powershell
-# Terminal 1, repository root
-uvicorn src.api.server:app --host 0.0.0.0 --port 8000
-
-# Terminal 2
-Set-Location frontend
-npm i
-npm run dev
-```
-
-Open `http://localhost:3000`. The frontend proxies API, image, snapshot,
-stream, and map requests through Next.js to `ANPR_API_URL` (defaults to
-`http://127.0.0.1:8000`). For a production frontend use `npm run build` then
-`npm start`; set `ANPR_API_URL` and `NEXTJS_URL` for the deployment.
-
-### Option 7: Legacy Streamlit dashboards
-
-```bash
+# Gate log dashboard
 streamlit run src/dashboard/app.py
+
+# Trajectory visualization dashboard
+streamlit run src/dashboard/trajectory_app.py
 ```
-
-Open `http://localhost:8501` in your browser. These optional legacy dashboards show:
-- Live event table (plate number, vehicle type, direction, timestamp)
-- Plate crop images
-- Detection statistics
-- Current Authorized / Blacklisted / Unknown status, with blacklist alerts
-- Date- and direction-filtered records and counters
-
-The Next.js dashboard shows every configured camera feed simultaneously.
-Per-camera status is based on the freshness of the annotated frames written by
-the running pipeline; an unconfigured or stale feed is shown as offline rather
-than being reported healthy because the API itself is reachable.
 
 ---
 
-##  Training Your Own Model
+## 🖥️ Next.js Operations Dashboard
 
-### Step 1 — Prepare your dataset
+The dashboard at `frontend/` provides:
 
-Place images in `dataset/train/images/` and JSON label files in `dataset/train/labels/`.
+- **Live Multi-Camera Wall**: Real-time video/MJPEG feeds from all registered campus gates with live FPS, frame counters, and feed status indicators (`HEALTHY`, `STALLED`, `OFFLINE`).
+- **Vehicle Access History & Filtering**: Filter entry/exit logs by date range, gate location, vehicle type, and IN/OUT direction.
+- **Whitelist & Blacklist Management**: Manage campus access lists directly from the UI with real-time blacklist violation alerts.
+- **Trajectory Journey Map**: Displays Leaflet-powered route reconstruction showing travel paths, transit speed estimates, and timestamps between cameras.
+- **Vehicle Profile Popups**: View full-size vehicle captures, plate crops, body color classifications, and visit frequencies.
+- **Data Export**: One-click CSV and Excel export of filtered security logs.
 
-Label file format (`dataset/train/labels/1.json`):
-```json
-{
-  "filename": "1.jpg",
-  "image_width": 500,
-  "image_height": 335,
-  "annotations": [
-    {
-      "vehicle_number": "KA19TR0234",
-      "class_id": 0,
-      "x_center": 0.479,
-      "y_center": 0.701,
-      "width": 0.398,
-      "height": 0.149
-    }
-  ]
-}
-```
+---
 
-### Step 2 — Convert to YOLO format
+## 🔬 Training & Model Evaluation
+
+To retrain the plate detection model on your own dataset:
 
 ```bash
+# 1. Convert JSON annotation labels to YOLO format
 python -m training.dataset_converter
-```
 
-This creates `dataset/yolo/train/` and `dataset/yolo/test/` with YOLO `.txt` label files and a `dataset.yaml`.
-
-### Step 3 — (Optional) Apply augmentation
-
-```bash
+# 2. (Optional) Run image augmentations (blur, glare, noise)
 python -m training.augmentation
-```
 
-### Step 4 — Train
-
-```bash
+# 3. Train YOLOv8m (100 epochs)
 python -m training.trainer
-```
 
-Trains YOLOv8m for 100 epochs. Saves `best.pt` to `models/plate_detector/best.pt`. Training graphs and logs go to `models/plate_detector/train/`.
-
-### Step 5 — Evaluate
-
-```bash
+# 4. Evaluate mAP, precision, and recall on test split
 python -m training.evaluator
 ```
 
-Saves `models/plate_detector/eval_report.json` with mAP, precision, recall, and FLOPs.
+Training and validation curves are saved to `models/plate_detector/train/`.
 
 ---
 
-##  API Reference
+## 📡 API Reference
 
-Start the server: `uvicorn src.api.server:app --host 0.0.0.0 --port 8000`
+Start server: `uvicorn src.api.server:app --host 0.0.0.0 --port 8000`
+
+### Core Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/logs?start_date=2026-11-10&end_date=2026-11-10&direction=IN` | Filter persisted events by local date and direction |
-| `GET` | `/search?plate=KA02MN1828&direction=OUT` | Search exact plate history with optional date/direction filters |
-| `GET` | `/stats?start_date=2026-11-10&end_date=2026-11-10` | Direction counters for the selected local date range (today by default) |
-| `GET` | `/trajectory-api/cameras/feeds` | Per-camera feed health and snapshot/MJPEG URLs |
-| `GET` | `/trajectory-api/cameras/{camera_id}/snapshot` | Latest annotated frame for one configured camera |
-| `GET` | `/trajectory-api/cameras/{camera_id}/stream` | MJPEG stream for one configured camera |
-| `GET/POST/DELETE` | `/access-control/whitelist` | List, add, or remove authorized plates |
-| `GET/POST/DELETE` | `/access-control/blacklist` | List, add, or remove blocked plates |
-| `POST` | `/entry` | Manually add a vehicle event |
+| `GET` | `/logs` | Retrieve vehicle events with `start_date`, `end_date`, `direction`, and `camera_id` filters. |
+| `GET` | `/search?plate=XX` | Search exact plate history with direction and date constraints. |
+| `GET` | `/stats` | Entry and exit counters for specified date ranges or all-time totals. |
+| `POST` | `/entry` | Programmatically register an entry/exit event. |
 
-`GET /logs`, `/live`, `/search`, and `/vehicles/{plate}` include an
-`access_status` value (`Authorized`, `Blacklisted`, or `Unknown`) computed
-from the current campus whitelist and blacklist. `/stats` accepts the same
-`direction` filter (`IN`, `OUT`, `UNKNOWN`, or `ALL`); omit both date bounds
-for today's local totals, or use `all_time=true` for all-time totals.
+### Access Control (Whitelist & Blacklist)
 
-Example response from `GET /logs`:
-```json
-[
-  {
-    "id": 1,
-    "plate_number": "KA02MN1828",
-    "vehicle_type": "Private",
-    "plate_color": "White",
-    "direction": "IN",
-    "access_status": "Authorized",
-    "timestamp": "2026-05-03T05:20:51Z",
-    "image_path": "data/plate_crops/KA02MN1828_20260503_052051.jpg",
-    "camera_id": "GATE-01",
-    "camera_name": "Main Gate",
-    "latitude": 28.613939,
-    "longitude": 77.209023
-  }
-]
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/access-control/whitelist` | List all authorized license plates. |
+| `POST` | `/access-control/whitelist` | Add a license plate to the authorized list. |
+| `DELETE` | `/access-control/whitelist/{plate}` | Remove an authorized plate. |
+| `GET` | `/access-control/blacklist` | List all blacklisted license plates. |
+| `POST` | `/access-control/blacklist` | Add a license plate to the blacklist. |
+| `DELETE` | `/access-control/blacklist/{plate}` | Remove a plate from the blacklist. |
 
-### Camera attribution
+### Multi-Camera & Trajectory Endpoints
 
-Every event records which camera saw it and where that camera is, taken from
-the `camera:` block of the capturing device's `config.yaml`:
-
-```yaml
-camera:
-  camera_id: "GATE-01"        # short stable code, unique per deployment
-  camera_name: "Main Gate"    # label shown in the dashboard
-  latitude: 28.613939         # decimal degrees (WGS84), or null if unsurveyed
-  longitude: 77.209023
-```
-
-Set these per Jetson when provisioning it; the pipeline reads them once at
-startup. `POST /entry` fills them in from the server's own config when the
-request omits them, so an existing client needs no changes.
-
-All four columns are nullable: events recorded before camera attribution
-existed, and gates whose coordinates haven't been surveyed, show as `—` on
-the dashboard. `init_db()` adds the columns to an existing database in place
-on first start, keeping the events already recorded.
-
-Full interactive docs at `http://localhost:8000/docs`.
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/trajectory-api/cameras/feeds` | Feed health, active status, and stream URLs for all cameras. |
+| `GET` | `/trajectory-api/cameras/{id}/snapshot` | Fetch the latest annotated JPEG frame for a camera. |
+| `GET` | `/trajectory-api/cameras/{id}/stream` | Continuous MJPEG stream for a camera. |
+| `GET` | `/trajectory-api/trajectories/{plate}` | Reconstruct ordered multi-camera trajectory for a plate. |
+| `GET` | `/trajectory-api/trajectories/map/{plate}` | Generate interactive Leaflet HTML route map for a vehicle. |
+| `GET` | `/trajectory-api/vehicles/{plate}` | Aggregated vehicle profile (sighting count, body color, first/last seen). |
 
 ---
 
-##  Next.js Dashboard
+## 🧪 Running Tests
 
-The primary operator dashboard lives in `frontend/`. It uses the existing
-FastAPI event, camera, feed-health, processing, vehicle-profile, trajectory,
-and map endpoints. Whitelist and blacklist management is exposed through
-`/access-control/whitelist` and `/access-control/blacklist`.
-
-Install and run it with:
-
-```powershell
-Set-Location frontend
-npm i
-npm run dev
-```
-
-The backend must be running on port 8000, or `ANPR_API_URL` must point to the
-API server. The development server runs on port 3000 by default.
-
----
-
-##  Legacy Streamlit Dashboards
-
-```bash
-streamlit run src/dashboard/app.py
-```
-
-- URL: `http://localhost:8501`
-- Optional alternative interface; the Next.js app is the primary frontend.
-- Shows: live event table, plate crop thumbnails, total count, IN/OUT breakdown,
-  and the camera (id, name, coordinates) each event came from
-
----
-
-##  Running Tests
+The test suite covers unit tests, ONNX inference, camera reconnects, early-exit OCR fusion, and API endpoints:
 
 ```bash
 # Run all tests
 pytest tests/
 
-# Run only unit tests
+# Run unit tests
 pytest tests/unit/
 
-# Run only integration tests
+# Run integration tests
 pytest tests/integration/
 
-# With coverage report
+# Run targeted unit tests
+pytest tests/unit/test_ocr_fusion_early_exit.py
+pytest tests/unit/test_onnx_yolo_runner.py
+pytest tests/unit/test_campus_direction.py
+pytest tests/unit/test_frame_capture_reconnect.py
+
+# Run with test coverage
 pytest tests/ --cov=src --cov-report=term-missing
 ```
 
 ---
 
-##  Model Performance
+## 📊 Model Performance & Benchmarks
 
-### Training (100 epochs, 1398 images, NVIDIA RTX 3050)
+### YOLOv8 Plate Detector Evaluation (Test Set)
 
-| Metric | Value |
-|---|---|
-| mAP50 | **99.47%** |
-| mAP50-95 | **93.0%** |
-| Precision | **99.29%** |
-| Recall | **99.91%** |
-| Training time | 6.29 hours |
-| Inference speed | 26.4 ms/image |
-
-### Test set (300 held-out images)
-
-| Metric | Value |
-|---|---|
-| mAP50 | **98.97%** |
-| mAP50-95 | **88.26%** |
-| Precision | **98.97%** |
-| Recall | **99.00%** |
-| Inference speed | 29.5 ms/image |
-
-### Model info
-
-| Property | Value |
-|---|---|
-| Architecture | YOLOv8m |
-| Parameters | 25.8M |
-| FLOPs | 78.7 GFLOPs |
-| Input size | 640×640 |
-| Training dataset | 1398 Indian plate images |
-
----
-
-##  Tech Stack
-
-| Component | Technology | Version |
+| Metric | Baseline YOLOv8m (`best.pt`) | Fine-Tuned Model (`best_finetuned.onnx`) |
 |---|---|---|
-| Vehicle detection | YOLOv8n (COCO pretrained) | ultralytics 8.2.0 |
-| Plate detection | YOLOv8m (custom trained) | ultralytics 8.2.0 |
-| Tracking | ByteTrack | supervision 0.20.0 |
-| Super resolution | Real-ESRGAN ×4 | realesrgan 0.3.0 |
-| OCR (default) | ParSeq Model|
-| OCR (optional) | TrOCR | transformers 4.40.0 |
-| Database | SQLite + SQLAlchemy | sqlalchemy 2.0.30 |
-| REST API | FastAPI | fastapi 0.111.0 |
-| Dashboard | Streamlit | streamlit 1.34.0 |
-| Language | Python | 3.10 |
-| GPU | NVIDIA RTX 3050 | CUDA 11.8 |
+| **mAP50** | 98.97% | **99.47%** |
+| **mAP50-95** | 88.26% | **93.00%** |
+| **Precision** | 98.97% | **99.29%** |
+| **Recall** | 99.00% | **99.91%** |
+| **Inference Runtime** | ~29.5 ms/image | **~4.7 ms/image (ONNX Runtime)** |
+
+### OCR Engine Benchmarks
+
+| OCR Engine | Hardware | Latency / Crop | Notes |
+|---|---|---|---|
+| **RapidOCR (PP-OCRv4 ONNX)** | CPU | **~40–70 ms** | Default engine; DBNet clamped, no PaddlePaddle needed |
+| **PARSeq TensorRT** | GPU (RTX / Orin) | **~3–6 ms** | Ultra-low latency GPU transformer backend |
+| **PaddleOCR** | CPU / GPU | ~180–300 ms | Baseline OCR engine |
+| **TrOCR (Transformers)** | GPU | ~150–220 ms | High accuracy on degraded/unusual fonts |
 
 ---
 
-##  Troubleshooting
+## 🛠️ Tech Stack
 
-**`ModuleNotFoundError: No module named 'src'`**
-Run all scripts from the project root directory, not from inside `scripts/`:
+| Domain | Technologies |
+|---|---|
+| **Detection & Tracking** | YOLOv8 (Ultralytics), ONNX Runtime, ByteTrack (Supervision) |
+| **Optical Character Recognition** | RapidOCR (PP-OCRv4 ONNX), TensorRT PARSeq, PaddleOCR, TrOCR |
+| **Super-Resolution & Preprocessing** | OpenCV, NumPy, CLAHE, Real-ESRGAN |
+| **Backend & APIs** | FastAPI, Uvicorn, Pydantic, SQLAlchemy |
+| **Databases** | SQLite (default), PostgreSQL |
+| **Frontend & UI** | Next.js 15, React 19, TypeScript, Tailwind CSS, Lucide React, Leaflet |
+| **Legacy Dashboards** | Streamlit |
+| **Testing** | Pytest, Hypothesis, Pytest-Cov |
+
+---
+
+## 🔧 Troubleshooting
+
+### `ModuleNotFoundError: No module named 'src'`
+Run all scripts from the repository root directory:
 ```bash
 # Correct
-python scripts/run_alpr.py --source ALPR.mp4
+python scripts/run_pipeline.py
 
-# Wrong
-cd scripts && python run_alpr.py
+# Incorrect
+cd scripts && python run_pipeline.py
 ```
 
-**`Cannot open video: ALPR.mp4`**
-Make sure the video file exists in the project root, or pass the full path:
-```bash
-python scripts/run_alpr.py --source "C:/Users/you/Videos/ALPR.mp4"
-```
+### RapidOCR / ONNX Runtime Execution
+RapidOCR executes via `onnxruntime`. If running on CPU, verify `config/config.yaml` has `ocr.rapidocr.det_limit_side_len: 320` and `use_cls: false` for maximum throughput.
 
-**PaddleOCR install fails**
-Install PaddlePaddle separately before running `pip install -r requirements.txt`:
-```bash
-pip install paddlepaddle==3.0.0
-```
+### RTSP Stream Reconnection
+If an RTSP feed disconnects or drops frames, `src/capture/frame_capture.py` automatically initiates background retries up to `video.max_retries` with exponential backoff and frame stall timeouts (`video.stall_timeout: 10.0`).
 
-**Real-ESRGAN is slow / out of memory**
-Set `sr_threshold_px: 0` in `config.yaml` to disable super-resolution, or reduce `batch_size` in training config.
-
-**`index 0 is out of bounds for axis 0 with size 0` warning**
-This is a non-fatal ByteTrack warning that appears when no detections are found in a frame. It does not affect results.
-
-**Only one vehicle detected in a multi-vehicle video**
-Increase `lost_track_timeout` in `config.yaml` and lower `vehicle_confidence` to `0.3`.
+### Camera Attribution Showing `—`
+If an existing database is used from an older version, previously recorded entries will display `—` for camera ID and GPS coordinates until new events with camera attribution are logged.
 
 ---
+
+## 📖 Documentation
+
+- [Multi-Camera Trajectory System Architecture](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md)
+- [PARSeq Deployment & TensorRT Export Guide](docs/PARSEQ_DEPLOYMENT.md)
+- [ALPR Technology Guide](docs/ALPR_Technology_Guide.html)
+- [Pipeline In-Depth Overview](docs/pipeline.md)
