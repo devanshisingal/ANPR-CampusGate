@@ -1,6 +1,6 @@
-#  ALPR University Gate System
+#  ANPR - Campus Gate 
 
-A production-quality **Automatic License Plate Recognition (ALPR)** system built for university gate access monitoring. It detects vehicles in video streams, reads Indian license plates using a custom-trained YOLOv8m model + PaddleOCR, classifies vehicle types, and logs every entry/exit event to a SQLite database with a Next.js operations dashboard and REST API. The older Streamlit dashboards remain available as optional legacy tools.
+A production-quality **Automatic Number Plate Recognition (ANPR)** system built for university gate access monitoring. It detects vehicles in video streams, reads Indian license plates using a custom-trained YOLOv8m model + PaddleOCR, classifies vehicle types, and logs every entry/exit event to a SQLite database with a Next.js operations dashboard and REST API. The older Streamlit dashboards remain available as optional legacy tools.
 
 ---
 
@@ -874,7 +874,3 @@ This is a non-fatal ByteTrack warning that appears when no detections are found 
 Increase `lost_track_timeout` in `config.yaml` and lower `vehicle_confidence` to `0.3`.
 
 ---
-
-##  Author
-
-Devanshi Singal
