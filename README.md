@@ -10,6 +10,8 @@ The system detects vehicles in live RTSP video feeds or recorded surveillance cl
 
 - [Features](#-features)
 - [System Architecture & Pipeline](#-system-architecture--pipeline)
+- [Campus-Specific Direction Detection](#-campus-specific-direction-detection)
+- [Dataset Splits & Annotation Forensics](#-dataset-splits--annotation-forensics)
 - [Multi-Camera Trajectory Reconstruction](#-multi-camera-trajectory-reconstruction)
 - [Project Structure](#-project-structure)
 - [What Each File Does](#-what-each-file-does)
@@ -18,6 +20,7 @@ The system detects vehicles in live RTSP video feeds or recorded surveillance cl
 - [Model Setup & Weights](#-model-setup--weights)
 - [Configuration Guide](#-configuration-guide)
 - [Usage — How to Run](#-usage--how-to-run)
+- [Streamlit Security Command Center](#-streamlit-security-command-center)
 - [Next.js Operations Dashboard](#-nextjs-operations-dashboard)
 - [Training & Model Evaluation](#-training--model-evaluation)
 - [API Reference](#-api-reference)
@@ -141,6 +144,51 @@ The system detects vehicles in live RTSP video feeds or recorded surveillance cl
 ```
 
 ---
+
+---
+
+## 🧭 Campus-Specific Direction Detection
+
+Campus gate cameras are mounted at angled perspectives where vehicles follow diagonal approach trajectories rather than simple vertical lines. The system uses vector dot-product trajectory estimation calibrated for actual physical CCTV views:
+
+| Camera ID | Gate Name | Image Movement Vector | Movement Direction | Target Unit Vector $(\hat{v}_x, \hat{v}_y)$ |
+|---|---|---|---|---|
+| **ch01** | Main Gate 2 | Moves towards lower-right | **IN** (Entering Campus) | $(+0.7071, +0.7071)$ |
+| **ch01** | Main Gate 2 | Moves towards upper-left | **OUT** (Exiting Campus) | $(-0.7071, -0.7071)$ |
+| **ch02** | Gate 2 | Moves towards lower-left | **IN** (Entering Campus) | $(-0.7071, +0.7071)$ |
+| **ch02** | Gate 2 | Moves towards upper-right | **OUT** (Exiting Campus) | $(+0.7071, -0.7071)$ |
+
+### Directional Trajectory Engine
+- **Centroid Vector Estimation**: Tracks vehicle centroids across a 15-frame rolling history buffer to compute the unit movement vector $(\hat{v}_x, \hat{v}_y)$.
+- **Angular Acceptance Cone**: Measures dot product against the camera profile's target vector ($cone\_angle = 55^\circ$); ambiguous cross-traffic evaluates cleanly to `UNKNOWN` (`❓`).
+- **Stationary Suppression**: Displacements $< 25\text{ px}$ are rejected to prevent idling vehicles from generating crossing events.
+- **Multi-Frame Confirmation & Lock**: Requires 3 consecutive matching votes before locking direction for that track, preventing duplicate crossing events or flip-flops.
+
+---
+
+## 📊 Dataset Splits & Annotation Forensics
+
+The system is trained and benchmarked on two specialized datasets with strict quality assurance and boundary forensics:
+
+### 1. YOLOv8 Plate Localization Dataset
+- **Total Images**: **25,674 full-frame images** with 26,701 annotated license plates (1.04 plates/image mean density).
+- **Partitioning**:
+  - **Train**: 20,580 images (80.16%)
+  - **Validation**: 4,116 images (16.03%)
+  - **Held-Out Test**: 978 images (3.81%)
+- **Zero-Copy Symlink Generation**: `training/prepare_dataset.py` constructs validation splits via filesystem symlinks.
+
+### 2. Plate OCR Recognition Dataset (`OCR_data/`)
+- **Total Samples**: **3,767 labeled cropped license plate image-text pairs**.
+- **Partitioning**: 70% Train (2,636 crops), 15% Validation (565 crops), 15% Test (566 crops) with fixed random seed (`seed = 42`).
+- **Standardized Resolution**: Normalized to $32 \times 128 \times 3$ grid for transformer OCR sequence recognition.
+
+### 3. Automated Forensics Validator (`training/dataset_validator.py`)
+- **Pairing & Orphan Checks**: Audits missing labels ($I \setminus L$) and orphan labels ($L \setminus I$).
+- **Bitstream Verification**: OpenCV binary read check to trap corrupted/truncated image files.
+- **Boundary Forensics**: Verifies normalized coordinates $x_c, y_c, w, h \in [0.0, 1.0]$ and ensures zero boxes extend outside canvas borders.
+- **Aspect Ratio Filtering**: Validates physical dimensions ($AR \in [1.2, 4.5]$) and rejects anomalous artifacts ($AR < 0.8$ or $AR > 6.0$).
+- For complete forensic validation reports, see [`docs/DATASET_FORENSICS.md`](docs/DATASET_FORENSICS.md).
 
 ## 🌐 Multi-Camera Trajectory Reconstruction
 
@@ -422,7 +470,7 @@ database:
 
 ## 💻 Usage — How to Run
 
-### Option 1: Full System (API + Next.js Dashboard)
+### Option 2: Full System (FastAPI + Next.js Dashboard)
 
 Start the system in two terminals:
 
@@ -441,7 +489,7 @@ npm run dev
 
 ---
 
-### Option 2: Run the Video Pipeline
+### Option 3: Run the Video Pipeline
 
 Run the end-to-end ANPR pipeline directly on a recorded video or RTSP feed:
 
@@ -458,7 +506,7 @@ Events are saved to `data/alpr.db`, with plate crops saved in `data/plate_crops/
 
 ---
 
-### Option 3: Multi-Camera Processing Queue
+### Option 4: Multi-Camera Processing Queue
 
 Process all registered campus cameras (from `config/camera_config.yaml`):
 
@@ -470,7 +518,7 @@ Runs sequential processing for recorded files and initiates live feeds concurren
 
 ---
 
-### Option 4: Quick Batch CSV Mode (No Database)
+### Option 5: Quick Batch CSV Mode (No Database)
 
 Extract unique license plates from a video directly into a CSV file without database setup:
 
@@ -480,7 +528,7 @@ python scripts/run_alpr.py --source ALPR.mp4 --output output/results.csv --min-r
 
 ---
 
-### Option 5: Export Annotated Video
+### Option 6: Export Annotated Video
 
 Generate an MP4 video overlaid with green vehicle bounding boxes, orange license plate boxes, and identified plate numbers:
 
@@ -490,17 +538,45 @@ python scripts/video_output.py --source ALPR.mp4 --output output/annotated.mp4
 
 ---
 
-### Option 6: Legacy Streamlit Dashboards
+### Option 1: Streamlit Security Command Center (Recommended Quickstart)
 
-For lightweight local inspection, the legacy Streamlit applications remain available:
+Launch the primary real-time operations dashboard:
 
 ```bash
-# Gate log dashboard
 streamlit run src/dashboard/app.py
-
-# Trajectory visualization dashboard
-streamlit run src/dashboard/trajectory_app.py
 ```
+- Open `http://localhost:8501` in your browser.
+- Displays live CCTV preview with bounding boxes, gate IN/OUT badges, date/direction filters, blacklist alerts, and whitelist management.
+
+---
+
+## 🛡️ Streamlit Security Command Center
+
+The Streamlit dashboard (`src/dashboard/app.py`) serves as the primary real-time operational monitor for security personnel and gate operators:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🚗 ALPR CampusGate — Security Operations Center              🟢 SYSTEM LIVE │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ [📋 Live Feed] [🔍 Search] [📊 Analytics] [🚗 History] [🛡️ Access] [⚙️ Config]│
+├──────────────────────────────────────┬──────────────────────────────────────┤
+│ 📹 Live Gate 2 Stream (30 FPS)       │ ℹ️ Gate Operations Metadata          │
+│                                      │ Camera ID    : GATE-02 (ch02)        │
+│    [ANNOTATED CCTV STREAM HERE]      │ Direction    : 📥 IN (Lower-Left)    │
+│    Vehicle Box: Car (Conf: 0.94)     │ Access Status: 🟢 AUTHORIZED         │
+│    Plate Box  : UP70PT5101           │ Latency      : 24 ms (GPU End-to-End)│
+├──────────────────────────────────────┴──────────────────────────────────────┤
+│ 📋 Filtered Records: [📥 142 Entries]  [📤 118 Exits]  [🚗 184 Unique Plates]│
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Dashboard Tabs
+1. **📋 Live Feed**: Displays real-time annotated frame (`data/live_frame.jpg`) with active stream latency, idle warnings, gate metadata, and prominent security alert cards for blacklisted sightings with snapshot images.
+2. **🔍 Search & Filters**: Multi-select filter by Direction (`IN`, `OUT`, `UNKNOWN`), date range sliders (1–30 days), and instantaneous alphanumeric plate search.
+3. **📊 Analytics**: Visualizes hourly traffic volume, entry/exit breakdown, and vehicle class distributions.
+4. **🚗 Vehicle History**: Chronological log displaying dual thumbnails (whole-vehicle crop and plate crop), timestamps, OCR confidence, camera site, and vehicle body/plate colors.
+5. **🛡️ Access Control**: Whitelist and Blacklist manager allowing operators to add or remove authorized registrations with live disk sync to `config/whitelist.yaml` and `config/blacklist.yaml`.
+6. **⚙️ Settings**: Controls refresh intervals, auto-refresh toggles, and system thresholds.
 
 ---
 
@@ -665,6 +741,7 @@ If an existing database is used from an older version, previously recorded entri
 
 ## 📖 Documentation
 
+- [Dataset Splits & Annotation Forensics](docs/DATASET_FORENSICS.md)
 - [Multi-Camera Trajectory System Architecture](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md)
 - [PARSeq Deployment & TensorRT Export Guide](docs/PARSEQ_DEPLOYMENT.md)
 - [ALPR Technology Guide](docs/ALPR_Technology_Guide.html)
