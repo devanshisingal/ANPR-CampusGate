@@ -1,0 +1,169 @@
+================================================================================
+ANPR-CAMPUSGATE: ACCURACY, BENCHMARKING & SOFTWARE TESTING REPORT
+================================================================================
+Project Directory : c:\Users\HP\Downloads\ANPR-RM
+Report Scope      : Ground-truth evidentiary summary of model localization
+                    accuracy, CPU/ONNX latency progression, frame-skip & alert-
+                    lead ablations, full 758-test pytest inventory, root-cause
+                    failure analysis, and untested verification gaps.
+Audit Date        : 2026-11-11
+================================================================================
+
+1. EXECUTIVE METRIC INTEGRITY STATEMENT
+--------------------------------------------------------------------------------
+A rigorous ANPR evaluation distinguishes three strictly non-interchangeable layers:
+  [Layer A] Plate Localization Accuracy (YOLO mAP50 / mAP50-95 / P / R)
+            Evaluates bounding box localization of plate patches ONLY.
+  [Layer B] Character Recognition Accuracy (CER / Sequence Match Rate)
+            Evaluates exact string decoding on cropped plates (UNBENCHMARKED!).
+  [Layer C] End-to-End Video System Recall, Speed (FPS), and Alert Lead Time
+            Evaluates full vehicle-to-alert/DB latency across real streams.
+
+Attempting to cite YOLOv8 validation mAP (`0.9832`) as "system ANPR accuracy"
+is methodologically invalid and is explicitly prevented throughout this report.
+
+--------------------------------------------------------------------------------
+2. PLATE DETECTOR LOCALIZATION METRICS (ALL 3 TRAINING RUNS COMPARED)
+--------------------------------------------------------------------------------
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| Checkpoint / Run Folder      | Backbone    | Split   | Prec   | Recall | mAP50    | mAP50-95 & Forensic Audit Verdict    |
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| models/plate_detector/train/ | YOLOv8m     | Val     | 0.9965 | 0.9918 | 0.9949   | 0.9302 [INVALID / LEAKED]            |
+| (Legacy RTX 3050 GPU run)    | 25.84M p.   | (~1,398)|        |        |          | dataset_converter.py set val == train|
+|                              | 78.7 GFLOPs |         |        |        |          | (val/box_loss 0.4154 < train 0.4469) |
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| models/plate_detector/       | YOLOv8m     | Test    |   -    |   -    | 0.9897   | 0.8826 [HISTORICAL JSON ONLY]        |
+| eval_report.json             | 25.84M p.   | (300)   |        |        |          | Raw 300 test images not in repository|
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| models/plate_detector/       | YOLOv8s     | Val     | 0.9776 | 0.9563 | 0.9803   | 0.6943 @ Best Ep 74 (of 94 early stp)|
+| train-3/best.pt              | 11.14M p.   | (1,973) |        |        |          | Peak mAP50 = 0.9832 @ Ep 51.         |
+| (RTX 2000 Ada 16GB, 6.13 h)  | 28.6 GFLOPs |         |        |        |          | Clean non-leaked 18,578 / 1,973 split|
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| models/plate_detector/       | YOLOv8s     | Test    | null*  | null*  | null*    | fitness = 0.691836 (*evaluate.py     |
+| evaluation_report.json       | 11.14M p.   | (978)   |        |        |          | extraction bug zeroed P/R/mAP fields)|
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+| models/plate_detector/       | YOLOv8n     | Val     | 0.9293 | 0.9759 | 0.9697   | 0.6350 @ Best Ep 29 (of 49 saved)    |
+| best_finetuned.{pt,onnx}     | 3.14M p.    | (~83?)  |        |        |          | Peak mAP50 = 0.9783 @ Ep 30.         |
+| (Kaggle T4, 8.05 min; ACTIVE)| ~8.7 GFLOPs |         |        |        |          | Note: .ipynb unexecuted; zip absent; |
+|                              |             |         |        |        |          | trained from COCO yolov8n, NOT best.pt|
++------------------------------+-------------+---------+--------+--------+----------+--------------------------------------+
+
+--------------------------------------------------------------------------------
+3. OCR MODEL TRAINING & ACCURACY GAP ANALYSIS
+--------------------------------------------------------------------------------
+3.1 Trained OCR Artifacts on Disk (`models/ocr/`)
+  - `best_parseq.pt` (2.86 MB, 714,724 params) & `parseq.engine` (1.52 MB):
+    Legacy custom CNN trained 100 epochs on `OCR_data` (3,767 plate images,
+    1,075 unique strings across `OCR_data/images` + `OCR_data/lables/` [sic]).
+  - `parseq_finetune_lightning_best.ckpt` (180.5 MB) -> `parseq_official_tiny.pt`
+    (24.13 MB) / `.onnx` (24.26 MB) / `.engine` (16.46 MB):
+    Fine-tuned `baudm/parseq-tiny` saved at Epoch 8 (`val_loss = 0.0955`).
+  - CRITICAL CPU LIMITATION: `parseq_official_tiny.onnx` raises
+    `NotImplemented: Could not find an implementation for Where(16)` under CPU
+    `onnxruntime`, preventing CPU deployment. Active CPU runs exclusively execute
+    `RapidOCR` (`rapidocr_onnxruntime` PP-OCR ONNX, `det_limit_side_len=320`,
+    `use_cls=false`).
+
+3.2 Verified Corpus Bias (`OCR_data/`, n = 3,767)
+  - Top 5 States account for 78.0% of all samples: MH (1,426 / 37.9%),
+    DL (524 / 13.9%), TN (355 / 9.4%), AP (352 / 9.3%), WB (284 / 7.5%).
+  - Width: 67-375 px (median 200, mean 201.7); Height: 15-117 px (median 50,
+    mean 52.6); 10-char strings: 2,600 (69.0%), 9-char strings: 963 (25.6%).
+
+3.3 UNBENCHMARKED GAP (MUST BE DISCLOSED IN VIVA)
+  - Zero labeled Character Error Rate (CER) or Exact String Accuracy benchmark
+    has been executed against `RapidOCR` or `parseq_official_tiny` across held-
+    out Indian license plate ground truth. Current confidence rests on runtime
+    pipeline smoke captures and live DB event inspections (`data/alpr.db`: 13 rows).
+
+--------------------------------------------------------------------------------
+4. CPU LATENCY, THROUGHPUT PROGRESSION & ABLATION BENCHMARKS
+--------------------------------------------------------------------------------
+Host Hardware: AMD Ryzen 7 7840HS (8C/16T), 16.71 GB RAM, Windows 11, CPU ORT.
+Evidence Sources: `logs/alpr.log` (23,254 lines) & `data/processing_status.json`.
+
+4.1 Optimization Trajectory Table
++----------------------------------------+------------+---------------+-----------+------------------+
+| Pipeline Configuration / Run           | Plate/Det  | OCR avg/call  | Measured  | Notes            |
+|                                        | avg (ms)   | (ms)          | FPS       |                  |
++----------------------------------------+------------+---------------+-----------+------------------+
+| Initial CPU Baseline (PyTorch + DB736  |   101.60   |    556.50     |   1.25    | Unusable on live |
+| + use_cls=True + CPU SR)               |            |               |           | CCTV streams     |
++----------------------------------------+------------+---------------+-----------+------------------+
+| Opt Pass 1 (`11:44`, 200f rolling log) |    30.67   |     47.24     |  12.51    | Vehicle 41.67 ms |
++----------------------------------------+------------+---------------+-----------+------------------+
+| Opt Pass 2 (`12:15`, 200f rolling peak)|    13.54   |     23.33     |  23.76    | Vehicle 35.26 ms |
++----------------------------------------+------------+---------------+-----------+------------------+
+| Full 1,500f Clip (`12:19`, `skip=1`)   |    13.40   |     23.62     |  19.18    | 78.20s wall time;|
+| (`test_video.mp4`, 60.00s video)       |            |               |           | 6/6 vehicles hit |
++----------------------------------------+------------+---------------+-----------+------------------+
+| Live UI Session (`14:43`, `CAM001.mp4` |    15.54   |     39.51     |  16.27    | 401f / 13.47s;   |
+| reported in `processing_status.json`)  |            |               |           | session 028d72   |
++----------------------------------------+------------+---------------+-----------+------------------+
+
+4.2 Frame-Skip Ablation (`test_video.mp4`, 1,500 Frames)
+  - `frame_skip = 1`: 19.18 FPS (`78.20s` total) -> **6 / 6 vehicles captured**
+  - `frame_skip = 2`: 17.12 FPS (`43.81s` total) -> **5 / 6 vehicles captured**
+    (Dropped Track 1 because doubled inter-frame displacement broke ByteTrack's
+     IoU association and reset `OCRFusion` vote accumulation).
+  -> Design Decision: Locked `video.frame_skip: 1` with `lost_track_timeout: 60`
+     and `minimum_matching_threshold: 0.5`.
+
+4.3 Pre-Store Blacklist Alert Lead Time Verification (`logs/alpr.log`)
+Decoupling `BlacklistManager` ahead of multi-frame `OCRFusion` consensus yielded
+measured alert lead times ahead of final database persistence:
+  - `UP53BI9424`             : **+1,127.0 ms** earlier (25 frames prior to DB commit)
+  - `BR07PB3395`             :   **+187.9 ms** earlier (25 frames prior to DB commit)
+  - `UP65DV7672` (Track 211) :   **+346.7 ms** earlier prior to DB commit
+
+--------------------------------------------------------------------------------
+5. COMPLETE PYTEST VERIFICATION BREAKDOWN (44 FILES / 758 COLLECTED TESTS)
+--------------------------------------------------------------------------------
+Collection Command: `.\.venv\Scripts\python.exe -m pytest --collect-only -q`
+Result            : 758 tests collected in 17.15s (446 Unit [33 files] +
+                    312 Integration [11 files]).
+
+5.1 Detailed Pass / Fail / Skip Matrix
++--------------------------------------------------------+------+------+----------+---------+------------------------+
+| Test Group                                             | Pass | Fail | Deselect | Env     | Notes / Timings        |
++--------------------------------------------------------+------+------+----------+---------+------------------------+
+| Unit Non-Socket Suite (31 files)                       |  404 |   0  |     0    | Sandbox | 12.57s (Re-verified)   |
+| Unit `test_parseq_dataset.py` + `test_super_resolution`|    5 |   3  |     0    | Sandbox | 19.26s (Pre-existing)  |
+| Unit Socket/Probe (`test_api_startup`, `backend_api`,  |   35 |   0  |     0    | Host*   | *Requires loopback/net |
+|   `test_network_probe`, `test_server_control`)         |      |      |          |         | outside sandbox        |
+| Int `test_database`, `test_blacklist`, `camera_manager`|   83 |   0  |     1    | Sandbox | 12.02s (`not real_prb`)|
+| Int `test_pipeline_smoke.py` (E2E 375f clip)           |    3 |   0  |     0    | Sandbox | 28.08s (Full ONNX+DB)  |
+| Int `test_vehicle_profiles`, `camera_cols`, `search`   |   59 |   0  |    13    | Sandbox | 3.63s (No ASGI API)    |
+| Int `test_trajectory_api.py` (DB Schema/Insert/Read)   |   15 |   0  |    42    | Sandbox | 1.97s (No ASGI API)    |
+| Int FastAPI Routes (`TestClient` / ASGI across suites) |   25 |   0  |     -    | Host*   | Verified outside sndbx |
+| Int `test_dashboard_smoke.py` (Streamlit AppTest)      |   55 |   3  |     0    | Host*   | Streamlit 1.67.0 drift |
+| Int `test_dataset_converter.py`                        |    1 |   0  |    19    | Sandbox | Remaining timed out I/O|
++--------------------------------------------------------+------+------+----------+---------+------------------------+
+
+5.2 Exact Root-Cause Analysis of All 6 Failures & Constraints
+  1. `test_parseq_dataset.py` (1 failure) & `test_super_resolution.py` (2 failures):
+     Pre-existing unit test drift vs refactored fallback signatures. Zero
+     runtime impact on active CPU pipeline (`sr_threshold_px = 0`).
+  2. `test_dashboard_smoke.py` (3 failures in Streamlit `1.67.0` AppTest):
+     (a) 2 tests call `at.get("imgs")` instead of Streamlit 1.67.0's `at.get("image")`.
+     (b) 1 date-filter test seeds synthetic timestamps (`Sept 12`) older than
+         the dashboard's default `"Last 7 days"` filter (`2026-11-11`).
+  3. Sandbox vs Host Execution Behavior:
+     Any pytest invoking FastAPI `TestClient` or Streamlit `AppTest` blocks on
+     restricted sandbox loopback sockets, requiring host execution or `-k`
+     exclusion of ASGI test classes inside sandboxed CI.
+
+--------------------------------------------------------------------------------
+6. UNTESTED REAL-WORLD FUNCTIONALITY CHECKLIST
+--------------------------------------------------------------------------------
+The following deployment validations remain UNTESTED and must be stated candidly:
+  [ ] Simultaneous >= 5-minute dual physical RTSP camera stream benchmark with
+      recorded per-camera FPS, RSS RAM, CPU%, and packet-drop recovery metrics.
+  [ ] Ground-truth confusion matrix for live campus IN vs OUT gate passes
+      across 2+ wheelers, sedans, and buses under dusk/glare conditions.
+  [ ] Automated Character Error Rate (CER) & Plate Accuracy eval on held-out
+      labeled campus frames for RapidOCR and PARSeq.
+  [ ] Execution benchmarking of `.engine` TensorRT plans on physical NVIDIA
+      Jetson hardware.
+================================================================================
+

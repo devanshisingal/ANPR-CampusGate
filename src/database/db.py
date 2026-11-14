@@ -419,6 +419,65 @@ def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
     return None
 
 
+def upgrade_recent_event(
+    session: Session,
+    plate_number: str,
+    direction: Optional[str] = None,
+    confidence: Optional[float] = None,
+    ocr_text: Optional[str] = None,
+    plate_thumbnail_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+) -> bool:
+    """Upgrade an existing recent event if direction was UNKNOWN or confidence improved.
+
+    This ensures that when a vehicle is first detected at distance with UNKNOWN direction,
+    and subsequently confirms direction (IN/OUT) or achieves a sharper plate read,
+    the existing record is updated rather than abandoned or duplicated.
+    """
+    try:
+        from src.validation.ocr_fusion import _levenshtein
+
+        recent = (
+            session.query(VehicleEvent)
+            .order_by(VehicleEvent.id.desc())
+            .limit(25)
+            .all()
+        )
+        for ev in recent:
+            is_match = (ev.plate_number == plate_number) or (
+                len(ev.plate_number) == len(plate_number)
+                and _levenshtein(ev.plate_number, plate_number) <= 1
+            )
+            if is_match:
+                changed = False
+                if direction in ("IN", "OUT") and ev.direction != direction:
+                    ev.direction = direction
+                    changed = True
+                if confidence is not None and (confidence > (ev.confidence or 0.0)):
+                    ev.plate_number = plate_number
+                    ev.confidence = confidence
+                    if ocr_text:
+                        ev.ocr_text = ocr_text
+                    if plate_thumbnail_path:
+                        ev.plate_thumbnail_path = plate_thumbnail_path
+                    if image_path:
+                        ev.image_path = image_path
+                    changed = True
+
+                if changed:
+                    session.commit()
+                    try:
+                        from src.database.vehicle_profiles import update_profile_for_event
+                        update_profile_for_event(session, ev)
+                    except Exception as prof_exc:
+                        _logger.debug("Profile update on event upgrade: %s", prof_exc)
+                    return True
+                return False
+    except Exception as exc:
+        _logger.warning("Failed to upgrade recent event for %s: %s", plate_number, exc)
+    return False
+
+
 def get_all_events(session: Session, limit: int = 1000) -> list[dict]:
     """Return all vehicle events ordered by timestamp descending."""
     events = (

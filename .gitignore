@@ -56,5 +56,9 @@ Thumbs.db
 # Archives
 *.zip
 
+# Scratch scripts and temporary files
+scratch/
+*.tsbuildinfo
+
 # Cameras added or removed from the dashboard (runtime state, per device).
 config/cameras_runtime.yaml

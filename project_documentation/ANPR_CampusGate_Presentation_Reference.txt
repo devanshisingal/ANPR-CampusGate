@@ -1,0 +1,435 @@
+================================================================================
+ANPR-CAMPUSGATE: ACADEMIC PRESENTATION DECK, SPEAKING SCRIPTS & VIVA Q&A
+================================================================================
+Prepared For : Project Defense / Academic Jury Presentation & Technical Viva
+Source Audit : Grounded strictly in verified repository evidence (2026-11-11)
+Figures Path : project_documentation/ANPR_CampusGate_Figures/01..08.png
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION A - 28-SLIDE PRESENTATION STRUCTURE & FIGURE MAPPING
+--------------------------------------------------------------------------------
+Slide  1 : Title Slide — ANPR-CampusGate: Real-Time Indian License Plate
+           Recognition, Pre-Store Security Alerting & Multi-Gate Trajectory
+           Intelligence (No chart; project title & stack badges)
+Slide  2 : Problem Statement — Campus Gate Bottlenecks & Failures of Manual Logs
+Slide  3 : Why Naive Single-Frame OCR Fails on Indian Mixed Traffic & HSRP Plates
+Slide  4 : Project Objectives, Target Users & Architectural Scope
+Slide  5 : End-to-End System Architecture Overview
+           [EMBED: 01_system_architecture.png]
+Slide  6 : Frame-by-Frame Data Flow & Early-Exit Optimization Lifecycle
+           [EMBED: 02_end_to_end_data_flow.png]
+Slide  7 : Hardware Footprint & Runtime Stack (Ryzen 7 CPU ONNX vs Jetson TRT)
+Slide  8 : Dataset Forensic Audit — Documented Claims vs On-Disk Truth
+           [EMBED: 04_dataset_forensic_breakdown.png]
+Slide  9 : Annotated OCR Corpus Profile (`OCR_data`: 3,767 Crops / 1,075 Plates)
+           [EMBED: 04_dataset_forensic_breakdown.png Panels B & C]
+Slide 10 : Dataset Hygiene & Security Discovery — Fixing `val == train` Leakage
+Slide 11 : Vehicle & Plate Detection Models (YOLOv8 CSPDarknet / PAN-FPN / CIoU)
+Slide 12 : YOLOv8s `train-3` Training Convergence (18,578 Train / 1,973 Val)
+           [EMBED: 05_training_curves_yolov8s_train3.png]
+Slide 13 : YOLOv8n Deployed `best_finetuned` vs Legacy YOLOv8m (`train/`)
+           [EMBED: 06_training_comparison_and_yolov8n_finetuned.png]
+Slide 14 : Vehicle Tracking (ByteTrack Kalman + Hungarian vs `frame_skip=1 vs 2`)
+Slide 15 : Dual OCR Engines — RapidOCR CPU (DBNet+SVTR) vs PARSeq ViT-PLM
+Slide 16 : Indian RTO Regex Validation, Slot Repair & Weighted `OCRFusion`
+Slide 17 : Zero-Wait Pre-Store Blacklist Hook (+188 ms to +1,127 ms Alert Lead)
+Slide 18 : Direction Classification (`IN`/`OUT`/`UNKNOWN`) & 30s `DuplicateFilter`
+Slide 19 : Database Architecture — Active ORM (`vehicle_events`/`profiles`) & WAL
+           [EMBED: 03_database_er_diagram.png]
+Slide 20 : Multi-Camera Orchestration (`CameraManager`, Queue vs Parallel `RLock`)
+Slide 21 : Backend FastAPI Architecture (41 REST + MJPEG Streaming Routes)
+Slide 22 : Operator Consoles — Next.js 15 Primary UI vs Streamlit v2 & Leaflet
+Slide 23 : CPU Performance Breakthrough (1.25 FPS -> 19.18 FPS Full / 23.76 Peak)
+           [EMBED: 07_model_size_and_pipeline_latency.png]
+Slide 24 : Verification & Pytest Matrix (44 Files, 758 Collected, Failures Audited)
+           [EMBED: 08_test_suite_inventory_and_status.png]
+Slide 25 : Engineering Challenges Solved (Hydration, ONNX `Where(16)`, Leak Audit)
+Slide 26 : Honest Audit Disclosure — Verified vs Partially Tested vs Untested
+Slide 27 : Future Roadmap (OCR CER Benchmark, Dual-RTSP Stress Test, Jetson TRT)
+Slide 28 : Live Demo Summary & Thank You / Q&A Invitation
+
+--------------------------------------------------------------------------------
+SECTION B - VERBATIM SPEAKING SCRIPTS (5-MINUTE & 10-MINUTE VERSIONS)
+--------------------------------------------------------------------------------
+
+=== [1] 5-MINUTE ELEVATOR DEFENSE SCRIPT (~680 words) ===
+
+"Good morning respected panel members. I am presenting ANPR-CampusGate, an
+end-to-end Automatic Number Plate Recognition and multi-gate vehicle tracking
+system built specifically for real-world Indian campus gates.
+
+Traditional campus gates rely on slow manual entry registers or basic single-
+image OCR tools that choke on motion blur, oblique angles, and ambiguous Indian
+characters like zero versus 'O', one versus 'I', or eight versus 'B'. Our
+objective was to engineer a reliable, CPU-deployable pipeline that not only
+logs entries with IN/OUT direction and vehicle attributes, but also raises an
+immediate security alert on watchlisted vehicles before they even clear the gate.
+
+Looking at Slide 5 [Figure 01], the architecture spans five integrated layers.
+Video frames enter through FrameCapture and CameraManager, pass into an ONNX
+YOLOv8n vehicle detector and supervision ByteTrack tracker, localize license
+plates via a 3.14-million-parameter YOLOv8n ONNX detector at 320px, decode text
+using CPU-tuned RapidOCR with Indian RTO syntax repair, aggregate reads through
+weighted temporal OCRFusion, and persist atomic records in SQLite WAL across two
+logically linked tables — 22-column vehicle_events and 25-column
+vehicle_profiles — surfaced through a 41-endpoint FastAPI backend to a Next.js
+15 operator console.
+
+Three architectural decisions drive our practical performance [Figure 02].
+First, decoupling blacklist alerting from fusion consensus: as soon as a
+single high-confidence frame matches blacklist.yaml, an alert fires ahead of
+database commit — measured at 188 milliseconds to 1,127 milliseconds earlier
+across test passes. Second, early track lock-out: once ByteTrack track ID 'tid'
+reaches consensus, stored_tracks skips redundant plate YOLO and RapidOCR work
+on exit frames. Third, CPU optimization: replacing PyTorch .pt inference and
+unbounded DBNet upscaling with quantized ONNX sessions, det_limit_side_len=320,
+and disabled angle classification boosted Ryzen 7 CPU throughput over 15x — from
+1.25 FPS baseline to 19.18 FPS across a full 1,500-frame benchmark (peaking at
+23.76 FPS rolling) while preserving 6/6 vehicle capture, whereas naive
+frame_skip=2 dropped a vehicle.
+
+On training and datasets [Figures 04-06], our audit ensures full scientific
+honesty. Our YOLOv8s detector train-3 achieved 0.9832 validation mAP50 across
+18,578 training and 1,973 validation images, while deployed YOLOv8n ONNX reached
+0.9783 peak val mAP50. Just as importantly, our self-audit uncovered that an
+earlier legacy YOLOv8m run had val==train data leakage, that documented
+'25,674' counts double-counted an imaginary 4,116 validation split, and that a
+full labeled campus OCR Character Error Rate benchmark remains future work
+since PARSeq ONNX failed on CPU due to Where(16) and RapidOCR was evaluated via
+E2E runs rather than a labeled OCR split.
+
+Finally [Figure 08], out of 758 pytest cases across 44 files, 404 non-socket
+unit tests, 160 non-socket integration DB/pipeline tests, 25 FastAPI ASGI
+tests, and a 375-frame E2E clip smoke test passed cleanly, with 6 pre-existing
+failures fully root-caused. Thank you — I welcome your questions."
+
+=== [2] 10-MINUTE DETAILED ACADEMIC DEFENSE SCRIPT (~1,350 words) ===
+
+"Respected Chair, examiners, and faculty members, welcome to the technical
+presentation of ANPR-CampusGate.
+
+[SLIDES 1-4: CONTEXT & PROBLEM]
+Indian university campuses handle heterogeneous traffic — two-wheelers, sedans,
+heavy delivery trucks, and campus buses — under harsh gate lighting and camera
+skew. Standard license plate detectors fail in three ways: they re-log the same
+slow car repeatedly, corrupt characters like DL7CD5017 when blurry, and run far
+too slowly (~1 FPS) on non-GPU gate PCs. ANPR-CampusGate solves all three while
+connecting sightings across multiple gates into vehicle movement trajectories.
+
+[SLIDES 5-7: ARCHITECTURE & FLOW — FIGURES 01 & 02]
+Tracing a single frame through run_pipeline.py: FrameCapture pulls frames from
+RTSP streams or queued MP4 files (`frame_skip=1`, `stall_timeout=10s`). Vehicle
+YOLO (`yolov8n.onnx` at 480px) locates cars, motorcycles, buses, and trucks
+above 0.50 confidence. ByteTrack maintains continuous `track_id` values with
+`lost_track_timeout=60` frames. Any vehicle track not yet in `stored_tracks`
+runs `MotionFilter` (`>=3px` movement) and enters Plate YOLO
+(`best_finetuned.onnx` at 320px, `conf=0.28`, min size `36x12px`). To bound CPU
+spikes in crowded scenes, at most 2 heavy tracks per file frame (or 1 live) run
+full OCR per frame in round-robin priority.
+
+Each cropped plate is resized to `64px` height, enhanced via adaptive gamma LUT
+and CLAHE (`sr_threshold_px=0` bypasses heavy super-resolution on CPU), and read
+by `RapidOCR` (DBNet + SVTR ONNX, angle classifier off). Next,
+`ocr_postprocessor` enforces Indian RTO regex and position-specific confusion
+repairs (`0/O`, `1/I`, `8/B`, `5/S`, `2/Z`), triggering immediate pre-store
+blacklist alerts at `>=0.70` confidence while buffering candidates inside
+`OCRFusion` (`window=5`). Once 3 uncontested reads agree at `>=0.82` (or 2 at
+`>=0.60`), `DuplicateFilter` checks a 30-second sliding window with Levenshtein
+distance `<= 2`, `DirectionDetector` classifies IN vs OUT using calibrated gate
+vectors and virtual lines, and `ALPRDatabase.insert_event()` commits the row.
+
+[SLIDES 8-13: DATASET & MODEL TRAINING FORENSICS — FIGURES 04, 05, 06]
+Because academic rigor demands verifying claims against artifacts, we performed
+a complete repository audit. First, training configurations documented 25,674
+images, but `dataset_validation_report.json` and `train-3/train.log` prove the
+verified disk dataset had 20,580 train images (split by Ultralytics into 18,578
+train + 1,973 val) and 978 test images = 21,529–21,558 images; '4,116' was an
+erroneous 20% addition on top of 20,580. On this clean split, YOLOv8s `train-3`
+converged over 94 epochs in 6.13 hours on an RTX 2000 Ada to `0.9832` peak
+mAP50 (`0.6943` mAP50-95 at epoch 74) and `0.6918` fitness on the 978-image test
+set.
+
+Second, deployed `best_finetuned.onnx` (12.88 MB) is a lighter 3.14M-parameter
+YOLOv8n trained on Kaggle T4 (49 epochs, `0.9783` peak val mAP50) initialized
+from COCO `yolov8n.pt` rather than fine-tuned from YOLOv8s `best.pt`. Because the
+`.ipynb` notebook is unexecuted and the 833-image zip is outside the repo, we
+explicitly flag that dataset split as unverified locally. Third, our audit
+caught and quarantined a legacy YOLOv8m run (`train/`) whose `mAP50=0.9949` was
+inflated by `val == train` leakage inside `dataset_converter.py`. On OCR, we
+verified 3,767 cropped plate images in `OCR_data` (1,075 unique plates; heavy
+Maharashtra 37.9% and Delhi 13.9% skew) used to train PARSeq-Tiny (`val_loss =
+0.0955` at Epoch 8).
+
+[SLIDES 14-22: PERSISTENCE, ORCHESTRATION & FRONTEND — FIGURE 03]
+On storage [Figure 03], active persistence runs on SQLite WAL mode across
+`vehicle_events` (22 columns) and `vehicle_profiles` (25 columns), synced via
+nested `SAVEPOINT` without brittle SQL foreign keys. Note that an unused
+6-table normalized schema exists in `postgres_schema.py` as future PostgreSQL
+scaffolding. Multi-camera management separates sequential MP4 upload queuing
+from parallel RTSP worker threads synchronized around shared ONNX inference via
+`threading.RLock()`. Operators interact via a Next.js 15 console wired through
+41 FastAPI REST/MJPEG endpoints, including a Leaflet multi-gate campus map and
+natural-language trajectory search.
+
+[SLIDES 23-28: BENCHMARKS, TESTING & HONEST LIMITATIONS — FIGURES 07 & 08]
+Our latency benchmarks [Figure 07] prove practical x86 CPU feasibility: cutting
+plate inference from 101.6 ms to 13.4 ms and OCR from 556.5 ms to 23.6 ms
+yielded 19.18 FPS across the full 1,500-frame benchmark (`frame_skip=1`, 6/6
+vehicles detected). Our 758-test pytest suite [Figure 08] verifies core
+modules cleanly, with all 6 failing tests cleanly explained by pre-existing test
+drift (`test_parseq_dataset`, `test_super_resolution`, and Streamlit 1.67.0
+`AppTest` element changes). Finally, we transparently disclose three remaining
+gaps as immediate next validation steps: a labeled OCR CER benchmark across
+`OCR_data`, sustained 5-minute dual-camera campus RTSP stress testing, and
+on-device NVIDIA Jetson TensorRT benchmarking. Thank you."
+
+--------------------------------------------------------------------------------
+SECTION C - 35 TECHNICAL VIVA QUESTIONS & EVIDENTIARY MODEL ANSWERS
+--------------------------------------------------------------------------------
+
+Q01: What is your project's actual end-to-end accuracy, and can you quote
+     0.9832 mAP50 as your system accuracy?
+A01: No — `0.9832` is strictly YOLOv8s `train-3` plate bounding-box localization
+     `mAP50` on its 1,973-image validation split (`0.6943 mAP50-95` at Ep 74).
+     End-to-end ALPR accuracy depends on detection recall x ByteTrack continuity
+     x OCR string accuracy x fusion voting. We transparently report that plate-
+     level CER / exact match on `OCR_data` is unbenchmarked locally, while our
+     full 1,500-frame video benchmark caught 6/6 vehicles at `frame_skip=1`.
+
+Q02: Why do your project configs say 25,674 training images when your audit
+     reports ~21,529-21,558?
+A02: `dataset_validation_report.json` states `"Split 'val' not found"` with
+     `20,580 train + 978 test = 21,558`. `train.log` shows Ultralytics carved
+     `1,973 val` out of `20,580` (`18,578 train + 1,973 val = 20,551`). The
+     `4,116` val figure in `config.json` equals `0.20 * 20,580`, erroneously
+     added on top of `20,580` instead of partitioned from it.
+
+Q03: Was `best_finetuned.onnx` fine-tuned by resuming weights from `best.pt`?
+A03: No. Forensic `torch.load` inspection proved `best.pt` is 11.14M-param
+     YOLOv8s, whereas `best_finetuned.pt` is 3.14M-param YOLOv8n trained from
+     COCO `yolov8n.pt` on Kaggle T4 (49 epochs, `mAP50=0.9697/0.9783`). It was
+     chosen as the active detector to minimize CPU latency (`13.4 ms` vs heavy
+     `YOLOv8s`).
+
+Q04: How do you prove legacy run `train/` had data leakage?
+A04: Two independent facts: (1) `training/dataset_converter.py` (L58-62) wrote
+     identical folder paths to both `train:` and `val:` keys; (2) in
+     `train/results.csv`, validation box loss (`0.4154`) finished LOWER than
+     training box loss (`0.4469`), yielding an unnatural `0.9949` mAP50.
+
+Q05: Why can't we deploy your fine-tuned PARSeq OCR ONNX model on CPU right now?
+A05: When executing `models/ocr/parseq_official_tiny.onnx` under CPU `onnxruntime`,
+     the transformer decoder hits `NotImplemented: Where(16)`. Thus CPU runs
+     use `RapidOCR`, reserving `parseq_official_tiny.engine` for TensorRT 10.16
+     NVIDIA Jetson/GPU hosts.
+
+Q06: Explain how you achieved a 15x speedup on CPU (1.25 FPS -> 19.18 FPS)
+     without losing detections.
+A06: Four concrete changes: (1) Custom `_onnx_yolo.py` ORT inference + lightweight
+     YOLOv8n (`320px` plate imgsz) cut plate det from 101.6 ms to 13.4 ms;
+     (2) RapidOCR `det_limit_type="max"`, `det_limit_side_len=320`, and
+     `use_cls=false` slashed OCR from 556.5 ms to 23.6 ms; (3) `sr_threshold_px=0`
+     bypassed CPU super-resolution; (4) `stored_tracks.add(tid)` eliminated
+     repeat OCR once a vehicle track reached consensus.
+
+Q07: Why is `frame_skip=1` slower in wall time (`78.2s` vs `43.8s`) than
+     `frame_skip=2`, yet preferred in `config.yaml`?
+A07: In our ablation on 1,500-frame `test_video.mp4`, `frame_skip=2` halved
+     processed frames but doubled inter-frame bbox motion, breaking ByteTrack
+     IoU matching and dropping Track 1 (5/6 vehicles caught vs 6/6 with
+     `frame_skip=1`). `frame_skip=1` also achieved higher per-frame throughput
+     (19.18 vs 17.12 FPS) and zero dropped vehicles.
+
+Q08: How does pre-store blacklist alerting work, and why not check after DB save?
+A08: Waiting for `OCRFusion` (3 agreeing frames) plus DB insert delays alerts by
+     up to 25 frames. Instead, `run_pipeline.py` queries `BlacklistManager`
+     immediately after any validated single-frame read meets `conf >= 0.70`,
+     firing alerts +187.9 ms to +1,127.0 ms earlier. A flag prevents re-firing
+     when Step 13 commits the event.
+
+Q09: What happens if a plate is misread slightly on two consecutive frames, say
+     `DL7CD5017` vs `DD77D5017`?
+A09: First, `ocr_postprocessor.py` applies Indian RTO slot logic (forcing letters
+     in positions 0-1 and digits in 2-3/tail). Second, `DuplicateFilter` uses a
+     30-second window and merges same-length strings within `Levenshtein <= 2`
+     (explicitly raised from 1 to 2 for this exact failure case), preventing
+     duplicate DB events.
+
+Q10: What is the tradeoff of `max_edit_distance: 2` in `DuplicateFilter`?
+A10: As documented in `config/config.yaml`, two genuinely distinct vehicles with
+     near-sequential fleet plates (e.g., `MH12AB1001` and `MH12AB1002`, edit
+     distance 1-2, same length) passing the exact same gate within 30 seconds
+     would be suppressed as duplicates. It is ideal for moderate campus flow
+     but should drop back to `<= 1` or rely on distinct `track_id` separation at
+     high-throughput toll gates.
+
+Q11: Why does `DuplicateFilter` require `len(a) == len(b)` before Levenshtein?
+A11: Without equal-length guarding, a truncated 7-char partial read (`MH12AB1`)
+     compared against an unrelated 9-char read (`MH12AB123`) already consumes 2
+     edits purely in length difference, creating false-positive merges.
+
+Q12: Walk through `OCRFusion`'s consensus vs EOF flush rules.
+A12: `OCRFusion` maintains a 5-frame deque per track. Early exit commits as soon
+     as 3 uncontested reads agree at weighted confidence `>= 0.82` (or `min_exact_votes=2`
+     with `min_confidence >= 0.60`). When a video clip ends, `flush_all()` finalizes
+     remaining unstored valid tracks with relaxed `>= 0.9 * min_confidence = 0.54`.
+
+Q13: Why are there no SQL `FOREIGN KEY` constraints between `vehicle_events`
+     and `vehicle_profiles`?
+A13: Joining logically via uppercase `plate_number` lets session clears
+     (`POST /api/events/clear`) or legacy imports add/delete event batches
+     without foreign-key cascade lockups. Sync uses a nested SQLAlchemy
+     `SAVEPOINT` inside `insert_event()` so profile JSON errors never roll back
+     the captured sighting event.
+
+Q14: What is `src/database/postgres_schema.py` doing if active ORM only uses
+     2 tables?
+A14: Audit trace proved `postgres_schema.py` (6 normalized tables + 1
+     materialized view `daily_traffic_stats`) is completely unreferenced by
+     active runtime code. Even under PostgreSQL (`DATABASE_URL`), SQLAlchemy
+     binds to `models.py` (`vehicle_events` and `vehicle_profiles`).
+
+Q15: Why did `evaluation_report.json` save `fitness: 0.691836` while `precision`,
+     `recall`, and `mAP50` were empty?
+A15: `training/evaluate.py` had a key-lookup mismatch extracting Ultralytics
+     metrics dictionary fields after `model.val(split='test')` ran across all
+     978 test images (`evaluate.log` verified the run, checkpoint fitness is
+     `0.1*mAP50 + 0.9*mAP50-95`).
+
+Q16: Explain how `VehicleTracker` keeps IDs during momentary occlusion, and what
+     happens if `supervision` fails.
+A16: `supervision.ByteTrack` uses a 7-state Kalman filter prediction plus
+     two-stage Hungarian IoU assignment matching high-conf then low-conf boxes,
+     keeping occluded tracks alive up to `lost_track_timeout = 60` processed
+     frames (`min_matching_thresh = 0.5`). If unavailable, `VehicleTracker`
+     falls back transparently to greedy frame-to-frame IoU matching.
+
+Q17: How does `DirectionDetector` distinguish `IN`, `OUT`, and `UNKNOWN`?
+A17: It tracks centroid histories `[cx, cy]` over `15` frames (`min_confirm_frames=3`,
+     `min_displacement_px=25.0`), checking dot-product alignment within
+     `cone_angle_deg=55.0` against calibrated `in_vector`/`out_vector` vectors
+     and `virtual_line` intersections per camera (`ch01`/`ch02`). Stationary cars
+     yield `UNKNOWN`.
+
+Q18: Why cap `max_heavy_tracks_per_frame` at `2` (files) / `1` (live)?
+A18: Heavy plate-YOLO + RapidOCR cost scales linearly (~20-40 ms/vehicle on CPU).
+     In a live 30 FPS feed, inspecting 4 cars in 1 frame overflows 33 ms frame
+     interval, causing `FrameCapture` to drop frames, which jumps box positions
+     and fragments ByteTrack IDs! Round-robin budget gating keeps frame pacing
+     smooth while un-stored cars wait 1-2 frames for OCR.
+
+Q19: Why set `enhancment.sr_threshold_px = 0` when `preprocessing.target_height_px = 64`?
+A19: RealESRGAN weights (`RealESRGAN_x4plus.pth`) are absent from disk, and
+     OpenCV cubic/SR fallback adds slow per-crop overhead before DBNet. Setting
+     `target_height_px = 64` handles fast pre-CLAHE upscaling directly at
+     minimal cost.
+
+Q20: How does `VehicleColorDetector` avoid getting fooled by sky reflections or
+     windshields?
+A20: Config `vehicle_color` sets `region_top = 0.35`, skipping the top 35% of
+     the bounding box (roof/windshield glare), sampling hood/body HSV channels,
+     thresholding `min_saturation=55` / `min_value=50`, and separating white/
+     silver/gray/black cleanly by median brightness percentile.
+
+Q21: How does `CameraManager` prevent thread contention between concurrent
+     cameras and uploaded videos?
+A21: Uploads run strictly sequentially via a single FIFO background queue
+     (`data/processing_status.json`), whereas live multi-camera RTSP capture
+     threads run in parallel and share ONNX model inference safely through a
+     re-entrant `threading.RLock()`.
+
+Q22: How do live MJPEG streams avoid half-written corrupt JPEGs on Windows?
+A22: `LiveFramePublisher` and status writers write bytes to a temporary file
+     via `tempfile.mkstemp()` in the same directory and execute atomic
+     `os.replace()`, which is atomic on Windows NTFS metadata updates.
+
+Q23: Why is `SQLite WAL mode` critical here?
+A23: Default SQLite rollback journaling blocks concurrent readers during writes.
+     Enabling `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, and a 30-second
+     busy timeout allows Next.js FastAPI polling (`GET /api/events`, `/api/stats`)
+     to run concurrently with active video inserts without `database is locked` errors.
+
+Q24: Explain the React hydration error you fixed in Next.js 15.
+A24: Browser form/autofill extensions inject attributes like `fdprocessedid`
+     into `<button>` and `<input>` elements before React hydrates, plus client-
+     side state differences triggered hydration mismatch warnings. Guarding
+     client-only rendering and normalizing button markup eliminated console errors.
+
+Q25: Why are there 6 failures across your 758-test pytest suite, and do they
+     indicate broken production logic?
+A25: None of the 6 fail on core runtime paths: 3 unit failures (`test_parseq_dataset`,
+     `test_super_resolution`) reflect outdated test mocks vs refactored APIs;
+     3 Streamlit `dashboard_v2` failures stem from Streamlit `1.67.0` changing
+     `at.get("imgs")` -> `at.get("image")` and hardcoded `Sept 12` test dates
+     falling outside `"Last 7 days"`.
+
+Q26: Why did `test_trajectory_api` / `TestClient` hang in the automated sandbox
+     but pass on host execution?
+A26: The isolated execution sandbox blocks loopback sockets required by FastAPI
+     `TestClient` / ASGI lifespan and Streamlit `AppTest` threads. Running pure
+     DB sub-suites (`-k "TestSchemaMigration or TestInsertAndRead"`) in-sandbox
+     passed 15/15 in 1.97s, and host execution passed 25 ASGI tests cleanly.
+
+Q27: Compare `YOLOv8` loss functions — why use CIoU + DFL instead of plain L1/L2?
+A27: Plain L2 misses scale invariance and aspect ratio alignment. `CIoU`
+     simultaneously optimizes IoU overlap, normalized center distance, and plate
+     aspect ratio `v`, while Distribution Focal Loss (`DFL`) models box edge
+     coordinates as probability distributions across 16 discrete bins for tight
+     localization around narrow rectangular license plates.
+
+Q28: Why does `RapidOCR` keep `use_det=true` on already-cropped plates instead
+     of passing straight to recognition?
+A28: Many Indian two-wheeler and commercial plates have **two-line** layouts
+     (`MH 12` over `AB 1234`). Keeping DBNet `use_det=true` (with `det_border_pad=16`
+     and `det_limit_side_len=320`) isolates both text lines reliably so the
+     adapter can sort top-to-bottom and concatenate them in reading order.
+
+Q29: How does `OCR_data` class/state distribution affect model generalization?
+A29: Direct file audit showed `MH` (37.9%) and `DL` (13.9%) dominate over half
+     the 3,767 images, while Northern/Eastern states tested in demo videos (`UP`,
+     `BR`) are sparsely represented (<1.5%). Expanding regional balanced plate
+     crops is a primary recommendation.
+
+Q30: Explain how multi-gate vehicle trajectory speed and distances are computed.
+A30: `VehicleProfile` appends `{camera_id, timestamp, direction, latitude,
+     longitude}` into `trajectory_history` (up to 500 entries). `TrajectoryEngine`
+     calculates Haversine surface distance between consecutive gate GPS coordinates
+     and divides by timestamp delta to build campus transition graphs and Leaflet maps.
+
+Q31: What security vulnerability exists in the current FastAPI backend?
+A31: All 41 REST endpoints — including destructive routes like `POST /api/events/clear`,
+     `POST/DELETE /api/blacklist`, and camera mutations — currently lack JWT/API-key
+     authentication or role-based access control. In deployment, they must sit
+     behind campus VPN/VLAN restrictions or an authenticating reverse proxy.
+
+Q32: How do `whitelist.yaml` and `blacklist.yaml` stay in sync during long
+     camera runs without restarting the server?
+A32: Both managers cache entries alongside file modification timestamps via
+     `os.path.getmtime()` and transparently reload from disk whenever an API
+     mutation or admin edit updates the YAML file.
+
+Q33: Why didn't you evaluate live dual-camera RTSP latency in this audit?
+A33: Physical dual campus RTSP feeds require active campus network connectivity
+     for >= 5 minutes with simultaneous live vehicles. Because this environment
+     ran offline/sandboxed with prerecorded gate clips, we documented dual-RTSP
+     stress testing explicitly as an unverified deployment step.
+
+Q34: If asked to migrate tomorrow to an NVIDIA Jetson Orin Nano at a physical
+     gate, what changes in `config/config.yaml`?
+A34: Point `vehicle_model_path` to `models/vehicle_detector/yolov8n.engine`,
+     `plate_model_path` to TensorRT `best.engine` / exported `best_finetuned.engine`,
+     switch `ocr.backend` to `"parseq_tensorrt"` (`parseq_official_tiny.engine`),
+     optionally supply `RealESRGAN_x4plus.pth` with `sr_threshold_px: 80`, and
+     run dual-RTSP 5-min verification to calibrate `live_max_heavy_tracks_per_frame`.
+
+Q35: What single upgrade would deliver the highest scientific credibility right now?
+A35: Implementing an automated ground-truth OCR & end-to-end gate accuracy
+     benchmark script across stratified `OCR_data` + labeled campus CCTV clips
+     to report verified Character Error Rate (CER), exact plate accuracy, and
+     Confusion Matrix metrics alongside existing YOLO mAP scores.
+
+================================================================================
+END OF PRESENTATION & VIVA REFERENCE
+================================================================================
+

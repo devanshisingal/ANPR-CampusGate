@@ -18,6 +18,7 @@ The caller is responsible for:
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
@@ -78,12 +79,23 @@ class OCRFusion:
         # track_id -> deque[(plate_string, confidence)]
         self._buffers: Dict[int, Deque[Tuple[str, float]]] = {}
 
-    def add_result(self, track_id: int, plate: str, confidence: float) -> None:
+    def add_result(
+        self,
+        track_id: int,
+        plate: str,
+        confidence: float,
+        crop_area: Optional[float] = None,
+    ) -> None:
         if track_id not in self._buffers:
             self._buffers[track_id] = deque(maxlen=self.window_size)
         if confidence < self.min_confidence:
             return
-        self._buffers[track_id].append((plate, float(confidence)))
+        conf = float(confidence)
+        weight = conf
+        if crop_area is not None and crop_area > 0:
+            scale = math.sqrt(max(float(crop_area), 100.0) / 2500.0)
+            weight = conf * float(max(0.5, min(2.5, scale)))
+        self._buffers[track_id].append((plate, conf, weight))
 
     def get_result(self, track_id: int) -> Tuple[str, float] | None:
         buf = self._buffers.get(track_id)
@@ -103,30 +115,43 @@ class OCRFusion:
         *,
         early_exact_votes: int = 2,
         min_consensus_conf: float = 0.75,
+        direction_confirmed: Optional[bool] = None,
     ) -> bool:
         """Return True when buffered reads already justify flushing this track.
 
-        Triggers either when the sliding window is full or when *early_exact_votes*
-        (and at least ``min_exact_votes``) identical reads form an uncontested,
-        high-confidence majority.
+        Triggers either when the sliding window is full (with at least ``min_exact_votes``
+        for the dominant plate) or when *early_exact_votes* identical reads form an
+        uncontested, high-confidence majority.
+
+        If *direction_confirmed* is explicitly False, premature early exit is
+        suppressed until the sliding window is full so active vehicles have time
+        to confirm travel direction before committing.
         """
         buf = self._buffers.get(track_id)
         if not buf:
             return False
-        if len(buf) >= self.window_size:
-            return True
-        required_votes = max(self.min_exact_votes, early_exact_votes)
-        if len(buf) < required_votes:
-            return False
 
         plate_confs: Dict[str, List[float]] = {}
-        for plate, conf in buf:
+        for entry in buf:
+            plate = entry[0]
+            conf = float(entry[1])
             plate_confs.setdefault(plate, []).append(conf)
 
         best_plate, confs = max(
             plate_confs.items(),
             key=lambda item: (len(item[1]), sum(item[1])),
         )
+        if len(confs) < self.min_exact_votes:
+            return False
+
+        if direction_confirmed is False:
+            return False
+
+        if len(buf) >= self.window_size:
+            avg_conf = sum(confs) / len(confs)
+            return bool(avg_conf >= self.min_confidence or max(confs) >= min_consensus_conf)
+
+        required_votes = max(self.min_exact_votes, early_exact_votes)
         if len(confs) < required_votes:
             return False
 
@@ -154,26 +179,38 @@ class OCRFusion:
     # Internal fusion
     # ------------------------------------------------------------------
 
-    def _fuse(self, entries: List[Tuple[str, float]]) -> Tuple[str, float]:
+    def _fuse(self, entries: List[Tuple]) -> Tuple[str, float]:
         """Fuse entries into (plate, fused_confidence).
         
         Uses a hybrid scoring system that balances:
         1. Frequency (how many times a plate appears)
         2. Confidence quality (average confidence per plate)
+        3. Area-weighted scoring where available
+        4. Confidence-weighted character-level positional voting across candidate variants
         
         This prevents high-confidence wrong plates from beating lower-confidence
-        correct plates when the wrong plate appears more frequently.
+        correct plates when the wrong plate appears more frequently, and resolves
+        individual character confusions (e.g. T vs I) using positional character consensus.
         """
         if not entries:
             return ("", 0.0)
         if len(entries) == 1:
-            return entries[0]
+            return (str(entries[0][0]), float(entries[0][1]))
+
+        # Normalize entries to (plate, conf, weight)
+        norm_entries: List[Tuple[str, float, float]] = []
+        for e in entries:
+            p = str(e[0])
+            c = float(e[1])
+            w = float(e[2]) if len(e) >= 3 else c
+            norm_entries.append((p, c, w))
 
         # Build clusters over DISTINCT plate strings.
-        # Each distinct plate contributes all its occurrences/confidences.
         plate_to_confs: Dict[str, List[float]] = {}
-        for plate, conf in entries:
+        plate_to_weights: Dict[str, List[float]] = {}
+        for plate, conf, weight in norm_entries:
             plate_to_confs.setdefault(plate, []).append(conf)
+            plate_to_weights.setdefault(plate, []).append(weight)
 
         distinct_plates: List[str] = list(plate_to_confs.keys())
 
@@ -206,52 +243,39 @@ class OCRFusion:
 
             clusters.append(cluster)
 
-        # Score clusters using hybrid metric: frequency * average confidence
-        # This prevents wrong plates with high individual confidence from beating
-        # correct plates with lower individual confidence but higher frequency.
-        # 
-        # Example:
-        #   Wrong plate: 4 times @ 0.60 avg = score 2.40
-        #   Correct plate: 3 times @ 0.94 avg = score 2.82
-        # Result: Correct plate wins despite lower frequency.
-
         best_cluster: Optional[_Cluster] = None
         best_score = -1.0
 
         for cluster_plates in clusters:
             cluster_confs: List[float] = []
+            cluster_weights: List[float] = []
             for p in cluster_plates:
                 cluster_confs.extend(plate_to_confs[p])
+                cluster_weights.extend(plate_to_weights[p])
 
             total_conf = sum(cluster_confs)
             cluster_count = len(cluster_confs)
             avg_confidence = total_conf / cluster_count if cluster_count > 0 else 0.0
 
             # Hybrid score: count * average_confidence
-            # Heavily weights both frequency and quality
             hybrid_score = cluster_count * avg_confidence
 
-            # Canonical plate: pick plate with highest *total* weighted confidence
-            # within the cluster (confidence-weighted majority at cluster level).
+            # Canonical plate: pick plate with highest total weighted confidence within cluster
             per_plate_sum: Dict[str, float] = {
-                p: sum(plate_to_confs[p]) for p in cluster_plates
+                p: sum(plate_to_weights[p]) for p in cluster_plates
             }
             per_plate_max: Dict[str, float] = {
                 p: max(plate_to_confs[p]) for p in cluster_plates
             }
 
-            # Primary: sum confidence within cluster
             best_plate_sum = max(per_plate_sum.keys(), key=lambda p: per_plate_sum[p])
-            # Secondary: max confidence for tie-breaking
             best_plate_max = max(per_plate_max.keys(), key=lambda p: per_plate_max[p])
 
-            # If sums are tied or nearly tied (within 1e-6), select by max conf.
             candidates = list(per_plate_sum.keys())
             max_sum = per_plate_sum[best_plate_sum]
             close = [p for p in candidates if abs(per_plate_sum[p] - max_sum) <= 1e-6]
             best_plate = best_plate_max if len(close) > 1 else best_plate_sum
 
-            # Update best cluster using hybrid score
             if best_cluster is None or hybrid_score > best_score:
                 best_cluster = _Cluster(
                     plates=cluster_plates,
@@ -260,7 +284,6 @@ class OCRFusion:
                 )
                 best_score = hybrid_score
             elif abs(hybrid_score - best_score) <= 1e-6:
-                # Tie-breaker on hybrid score: use higher per-plate sum
                 if per_plate_sum[best_plate] > per_plate_sum.get(best_cluster.best_plate, 0.0):
                     best_cluster = _Cluster(
                         plates=cluster_plates,
@@ -271,13 +294,30 @@ class OCRFusion:
 
         assert best_cluster is not None
 
-        # Similar strings are useful for clustering, but they must not turn a
-        # sequence of unrelated OCR guesses into a stored plate.  Requiring
-        # exact repeated text is the safe gate for live ALPR deployments.
-        if len(plate_to_confs[best_cluster.best_plate]) < self.min_exact_votes:
-            return ("", 0.0)
+        # Confidence-weighted character-level voting across equal-length variants in cluster
+        canonical_plate = best_cluster.best_plate
+        same_len_plates = [p for p in best_cluster.plates if len(p) == len(canonical_plate)]
+        if len(same_len_plates) > 1 and len(canonical_plate) > 0:
+            voted_chars = []
+            for pos in range(len(canonical_plate)):
+                char_weights: Dict[str, float] = {}
+                for p in same_len_plates:
+                    w_sum = sum(plate_to_weights.get(p, plate_to_confs.get(p, [1.0])))
+                    ch = p[pos]
+                    char_weights[ch] = char_weights.get(ch, 0.0) + w_sum
+                top_char = max(char_weights.keys(), key=lambda ch: char_weights[ch])
+                voted_chars.append(top_char)
+            consensus_str = "".join(voted_chars)
+            if consensus_str in plate_to_confs or consensus_str in best_cluster.plates:
+                canonical_plate = consensus_str
 
-        # Return best cluster's canonical plate and max confidence from all entries
-        best_single = max(entries, key=lambda e: e[1])
-        return (best_cluster.best_plate, best_single[1])
+        # Safe gate: require at least min_exact_votes for the canonical plate or cluster seed
+        votes_count = len(plate_to_confs.get(canonical_plate, []))
+        if votes_count < self.min_exact_votes:
+            if len(plate_to_confs.get(best_cluster.best_plate, [])) < self.min_exact_votes:
+                return ("", 0.0)
+            canonical_plate = best_cluster.best_plate
+
+        best_single = max(norm_entries, key=lambda e: e[1])
+        return (canonical_plate, best_single[1])
 

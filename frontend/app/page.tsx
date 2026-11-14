@@ -66,6 +66,8 @@ type Feed = {
   last_frame_at?: string | null;
   frame_age_seconds?: number | null;
   processing_state: string;
+  has_frame?: boolean;
+  snapshot_url?: string;
   stream_url: string;
 };
 type Stats = {
@@ -652,28 +654,152 @@ function CameraTile({ feed, camera, disabled, onUpload, onSetRtsp, onRename, onR
   const [showNameForm, setShowNameForm] = useState(false);
   const [rtsp, setRtsp] = useState("");
   const [cameraName, setCameraName] = useState(feed.camera_name);
-  const [imageBroken, setImageBroken] = useState(false);
+  const [streamError, setStreamError] = useState(false);
+  const [snapshotNonce, setSnapshotNonce] = useState(() => Date.now());
+
   const online = feed.online;
+  const isRunning = feed.processing_state === "running";
+  const isCompleted = feed.processing_state === "completed";
+  const isPending = feed.processing_state === "pending";
+  const isFailed = feed.processing_state === "failed";
+  const hasFrame = Boolean(feed.last_frame_at || feed.has_frame);
+
+  useEffect(() => {
+    setStreamError(false);
+    setSnapshotNonce(Date.now());
+  }, [feed.processing_state, feed.last_frame_at, feed.online]);
+
+  useEffect(() => {
+    if (!isRunning) return;
+    const interval = setInterval(() => {
+      setSnapshotNonce(Date.now());
+    }, 600);
+    return () => clearInterval(interval);
+  }, [isRunning]);
+
+  let imageSrc: string | null = null;
+  if (isRunning) {
+    imageSrc = !streamError
+      ? `/backend/trajectory-api/cameras/${encodeURIComponent(feed.camera_id)}/stream`
+      : `/backend/trajectory-api/cameras/${encodeURIComponent(feed.camera_id)}/snapshot?t=${snapshotNonce}`;
+  } else if (hasFrame) {
+    imageSrc = `/backend/trajectory-api/cameras/${encodeURIComponent(feed.camera_id)}/snapshot?t=${encodeURIComponent(feed.last_frame_at || "latest")}`;
+  }
+
+  let labelText = "NO SIGNAL";
+  let labelDotClass = "offline-dot";
+  let labelDotStyle: React.CSSProperties | undefined = undefined;
+
+  if (isRunning) {
+    labelText = "LIVE";
+    labelDotClass = "pulse-dot";
+  } else if (isCompleted) {
+    labelText = "COMPLETED";
+    labelDotClass = "stat-dot green";
+    labelDotStyle = { background: "#14aa88" };
+  } else if (isPending) {
+    labelText = "QUEUED";
+    labelDotClass = "stat-dot amber";
+    labelDotStyle = { background: "#f59e0b" };
+  } else if (isFailed) {
+    labelText = "FAILED";
+    labelDotClass = "offline-dot";
+  } else if (online) {
+    labelText = "ONLINE";
+    labelDotClass = "pulse-dot";
+  } else if (hasFrame) {
+    labelText = "READY";
+    labelDotClass = "stat-dot green";
+    labelDotStyle = { background: "#14aa88" };
+  }
+
   return (
     <article className="camera-card">
       <div className="camera-preview">
-        {online && !imageBroken
-          ? <img src={`/backend/trajectory-api/cameras/${encodeURIComponent(feed.camera_id)}/stream`} alt={`Live feed from ${feed.camera_name}`} onError={() => setImageBroken(true)} />
-          : <div className="feed-placeholder"><div className="feed-placeholder-icon"><Camera size={22} /></div><strong>{online ? "Connecting to camera…" : "Feed unavailable"}</strong><span>{online ? "Waiting for the live preview." : "A fresh camera frame has not been received."}</span></div>}
-        <span className="preview-label"><span className={online ? "pulse-dot" : "offline-dot"} />{online ? "LIVE" : "NO SIGNAL"}</span>
+        {imageSrc
+          ? <img
+              key={`${feed.camera_id}-${isRunning ? (streamError ? snapshotNonce : "stream") : "static"}`}
+              src={imageSrc}
+              alt={`Feed from ${feed.camera_name}`}
+              onError={() => {
+                if (isRunning && !streamError) {
+                  setStreamError(true);
+                }
+              }}
+            />
+          : <div className="feed-placeholder">
+              <div className="feed-placeholder-icon"><Camera size={22} /></div>
+              <strong>{isRunning ? "Starting camera feed…" : isPending ? "Queued for processing" : isFailed ? "Camera processing failed" : "Feed unavailable"}</strong>
+              <span>{isRunning ? "Waiting for the first video frame." : isPending ? "Processing will begin after previous camera finishes." : camera?.video_path || camera?.rtsp_url ? "A fresh camera frame has not been received." : "Upload a video or set an RTSP source."}</span>
+            </div>}
+        <span className="preview-label">
+          <span className={labelDotClass} style={labelDotStyle} />{labelText}
+        </span>
         <span className="preview-channel">{feed.camera_id}</span>
       </div>
       <div className="camera-card-body">
-        <div className="camera-title-row"><div><h3>{feed.camera_name}</h3><span>{camera?.source_type === "rtsp" ? "RTSP stream" : camera?.source_type === "upload" ? "Video source" : "Camera source not set"}</span></div><span className={`camera-status ${online ? "camera-online" : "camera-offline"}`}><i />{online ? "Online" : "Offline"}</span></div>
-        <div className="camera-metadata"><span><Clock3 size={13} />{feed.last_frame_at ? `Last frame ${formatTime(feed.last_frame_at)}` : "No frame received"}</span><span><Activity size={13} />{feed.processing_state || "idle"}</span></div>
-        <div className="camera-actions">
-          <label className="button button-small button-muted upload-button"><Upload size={14} /> Upload video<input type="file" accept="video/*" disabled={disabled} onChange={(event) => { const file = event.target.files?.[0]; if (file) onUpload(file); event.currentTarget.value = ""; }} /></label>
-          <button className="button button-small button-muted" disabled={disabled} onClick={() => setShowSourceForm((current) => !current)}><Radio size={14} /> RTSP source</button>
-          <button className="button button-small button-muted" disabled={disabled} onClick={() => { setCameraName(feed.camera_name); setShowNameForm((current) => !current); }}>Rename</button>
-          <button className="remove-button camera-remove" aria-label={`Remove ${feed.camera_name}`} disabled={disabled} onClick={onRemove}><Trash2 size={14} /></button>
+        <div className="camera-title-row">
+          <div>
+            <h3>{feed.camera_name}</h3>
+            <span>{camera?.source_type === "rtsp" ? "RTSP stream" : camera?.source_type === "upload" ? (camera.video_path ? `File: ${camera.video_path.split("/").pop()}` : "Video source") : "Camera source not set"}</span>
+          </div>
+          <span className={`camera-status ${online || isRunning || isCompleted ? "camera-online" : "camera-offline"}`}>
+            <i />{isRunning ? "Processing" : isCompleted ? "Completed" : isPending ? "Queued" : isFailed ? "Failed" : online ? "Online" : "Offline"}
+          </span>
         </div>
-        {showSourceForm && <form className="rtsp-form" onSubmit={(event) => { event.preventDefault(); if (rtsp.trim()) { onSetRtsp(rtsp.trim()); setRtsp(""); setShowSourceForm(false); } }}><input type="url" required placeholder="rtsp://user:password@host/stream" value={rtsp} onChange={(event) => setRtsp(event.target.value)} aria-label={`RTSP URL for ${feed.camera_name}`} /><button className="button button-small button-primary" disabled={disabled}>Save</button></form>}
-        {showNameForm && <form className="rtsp-form" onSubmit={(event) => { event.preventDefault(); if (cameraName.trim()) { onRename(cameraName.trim()); setShowNameForm(false); } }}><input required maxLength={100} value={cameraName} onChange={(event) => setCameraName(event.target.value)} aria-label={`New name for ${feed.camera_name}`} /><button className="button button-small button-primary" disabled={disabled}>Save name</button></form>}
+        <div className="camera-metadata">
+          <span><Clock3 size={13} />{feed.last_frame_at ? `Last frame ${formatTime(feed.last_frame_at)}` : "No frame received"}</span>
+          <span><Activity size={13} />{feed.processing_state || "idle"}</span>
+        </div>
+        <div className="camera-actions">
+          <label className="button button-small button-muted upload-button">
+            <Upload size={14} /> Upload video
+            <input
+              type="file"
+              accept="video/*"
+              disabled={disabled}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) onUpload(file);
+                event.currentTarget.value = "";
+              }}
+            />
+          </label>
+          <button className="button button-small button-muted" disabled={disabled} onClick={() => setShowSourceForm((current) => !current)}>
+            <Radio size={14} /> RTSP source
+          </button>
+          <button className="button button-small button-muted" disabled={disabled} onClick={() => { setCameraName(feed.camera_name); setShowNameForm((current) => !current); }}>
+            Rename
+          </button>
+          <button className="remove-button camera-remove" aria-label={`Remove ${feed.camera_name}`} disabled={disabled} onClick={onRemove}>
+            <Trash2 size={14} />
+          </button>
+        </div>
+        {showSourceForm && (
+          <form className="rtsp-form" onSubmit={(event) => {
+            event.preventDefault();
+            if (rtsp.trim()) {
+              onSetRtsp(rtsp.trim());
+              setRtsp("");
+              setShowSourceForm(false);
+            }
+          }}>
+            <input type="url" required placeholder="rtsp://user:password@host/stream" value={rtsp} onChange={(event) => setRtsp(event.target.value)} aria-label={`RTSP URL for ${feed.camera_name}`} />
+            <button className="button button-small button-primary" disabled={disabled}>Save</button>
+          </form>
+        )}
+        {showNameForm && (
+          <form className="rtsp-form" onSubmit={(event) => {
+            event.preventDefault();
+            if (cameraName.trim()) {
+              onRename(cameraName.trim());
+              setShowNameForm(false);
+            }
+          }}>
+            <input required maxLength={100} value={cameraName} onChange={(event) => setCameraName(event.target.value)} aria-label={`New name for ${feed.camera_name}`} />
+            <button className="button button-small button-primary" disabled={disabled}>Save name</button>
+          </form>
+        )}
       </div>
     </article>
   );

@@ -61,8 +61,8 @@ detection:
   plate_model_path: "models/plate_detector/best_finetuned.onnx"
   plate_confidence: 0.28                   # Tuned for single best_finetuned.onnx recall
   plate_imgsz: 320                         # plate search is within an already-localized vehicle crop
-  min_plate_width_px: 36                   # skip blurry specks smaller than 36x12 before OCR
-  min_plate_height_px: 12
+  min_plate_width_px: 60                   # skip blurry specks smaller than 60x20 before OCR
+  min_plate_height_px: 20
 
   # -- Ensemble Fusion --------------------------------------------------------
   # Disabled in normal operation per user performance setup; single

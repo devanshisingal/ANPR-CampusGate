@@ -141,8 +141,6 @@ class PlatePreprocessor:
             return plate_crop
 
         try:
-
-
             # Step 1: Grayscale
             if len(plate_crop.shape) == 3:
                 gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)

@@ -162,16 +162,39 @@ def _store_event(
     insert_event) happens only here -- once per stored vehicle, never per
     frame -- so it does not touch the per-frame inference path.
     """
+    get_direction = getattr(direction_detector, "get_direction", None)
+    direction = get_direction(track_id) if callable(get_direction) else None
+    if not direction or direction == "UNKNOWN":
+        direction = direction_detector.update(track_id, centroid) or "UNKNOWN"
+
     if dup_filter.is_duplicate(plate_number, track_id):
+        # If this observation has a confirmed direction ("IN" / "OUT") or high confidence,
+        # upgrade any existing recent record that lacked direction or had a lower-confidence read.
+        if direction in ("IN", "OUT") or (confidence is not None and confidence >= 0.90):
+            try:
+                with database.get_session() as session:
+                    upgraded = database.upgrade_recent_event(
+                        session=session,
+                        plate_number=plate_number,
+                        direction=direction if direction in ("IN", "OUT") else None,
+                        confidence=confidence,
+                        ocr_text=ocr_text,
+                    )
+                    if upgraded:
+                        log.info(
+                            "🔄 UPGRADED EVENT: plate=%s dir=%s conf=%s",
+                            plate_number,
+                            direction,
+                            f"{confidence:.2f}" if confidence is not None else "n/a",
+                        )
+                        return True
+            except Exception as up_exc:
+                log.debug("Event upgrade attempt: %s", up_exc)
         log.info("DUPLICATE skipped: %s (track %d)", plate_number, track_id)
         return False
 
     color = color_classifier.classify(plate_crop)
     vehicle_type = vehicle_classifier.classify(color)
-    get_direction = getattr(direction_detector, "get_direction", None)
-    direction = get_direction(track_id) if callable(get_direction) else None
-    if not direction or direction == "UNKNOWN":
-        direction = direction_detector.update(track_id, centroid) or "UNKNOWN"
     image_path = database.save_plate_image(plate_crop, plate_number, image_save_path)
 
     # Only written when a crop was actually passed in, so the single-gate
@@ -892,17 +915,20 @@ def run_pipeline(
                     ):
                         alerted_tracks.add(tid)
 
-                # Add to fusion buffer
-                ocr_fusion.add_result(tid, plate_number, confidence)
+                # Add to fusion buffer with plate crop area weighting
+                ocr_fusion.add_result(tid, plate_number, confidence, crop_area=plate_area)
                 track_fusion_votes[tid] += 1
 
                 # Peek first; only flush & retire once fusion yields a storeable
-                # consensus (avoid wiping the sliding deque when a full window
-                # still lacks min_exact_votes).
+                # consensus. If the track is still actively moving towards the gate
+                # and direction has not yet confirmed, suppress premature early-exit
+                # until direction confirms or the full sliding window is gathered.
+                dir_confirmed = direction_detector.is_confirmed(tid)
                 if ocr_fusion.has_consensus(
                     tid,
                     early_exact_votes=early_exit_votes,
                     min_consensus_conf=early_exit_min_conf,
+                    direction_confirmed=dir_confirmed,
                 ):
                     result = ocr_fusion.get_result(tid)
                     if result:

@@ -217,14 +217,19 @@ def camera_feed_status():
             online = False
             last_frame_at = None
         progress = progress_by_id.get(camera.camera_id) or {}
+        processing_state = progress.get("state", "idle")
+        is_running = processing_state == "running"
+        has_frame = last_frame_at is not None
+        online = camera.enabled and (is_running or (age is not None and age <= stale_after))
         feeds.append({
             "camera_id": camera.camera_id,
             "camera_name": camera.camera_name,
             "enabled": camera.enabled,
             "online": online,
+            "has_frame": has_frame,
             "last_frame_at": last_frame_at,
             "frame_age_seconds": round(age, 2) if age is not None else None,
-            "processing_state": progress.get("state", "idle"),
+            "processing_state": processing_state,
             "snapshot_url": f"/trajectory-api/cameras/{camera.camera_id}/snapshot",
             "stream_url": f"/trajectory-api/cameras/{camera.camera_id}/stream",
         })
@@ -236,8 +241,12 @@ def camera_snapshot(camera_id: str):
     """Serve the latest annotated frame produced by this camera."""
     path = _camera_frame_path(camera_id)
     if not path.is_file():
-        raise HTTPException(status_code=503, detail="No frame available for this camera")
-    return FileResponse(str(path), media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="No frame available for this camera")
+    return FileResponse(
+        str(path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @router.get("/cameras/{camera_id}/stream")
@@ -253,18 +262,35 @@ async def camera_stream(camera_id: str):
 
     async def frame_generator():
         last_mtime = None
+        last_data = None
+        last_sent = 0.0
         while True:
             try:
-                modified_at = path.stat().st_mtime
-                if modified_at != last_mtime:
-                    last_mtime = modified_at
-                    data = path.read_bytes()
-                    yield (
-                        f"--{boundary}\r\n"
-                        f"Content-Type: image/jpeg\r\n"
-                        f"Content-Length: {len(data)}\r\n\r\n"
-                    ).encode("ascii") + data + b"\r\n"
+                if path.is_file():
+                    modified_at = path.stat().st_mtime
+                    if modified_at != last_mtime:
+                        last_mtime = modified_at
+                        data = path.read_bytes()
+                        last_data = data
+                        last_sent = time.monotonic()
+                        yield (
+                            f"--{boundary}\r\n"
+                            f"Content-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(data)}\r\n\r\n"
+                        ).encode("ascii") + data + b"\r\n"
+                    elif last_data is not None and (time.monotonic() - last_sent) >= 1.0:
+                        # Heartbeat: repeat the latest frame once a second to keep proxies from hanging up
+                        last_sent = time.monotonic()
+                        yield (
+                            f"--{boundary}\r\n"
+                            f"Content-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(last_data)}\r\n\r\n"
+                        ).encode("ascii") + last_data + b"\r\n"
             except FileNotFoundError:
+                pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
                 pass
             await asyncio.sleep(poll_interval)
 
